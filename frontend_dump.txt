@@ -1,0 +1,3531 @@
+﻿
+===== FILE: lib\core\api_client.dart =====
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'constants.dart';
+
+class ApiException implements Exception {
+  final String message;
+  final int? statusCode;
+  final Map<String, dynamic>? errors;
+  ApiException(this.message, {this.statusCode, this.errors});
+
+  @override
+  String toString() => message;
+}
+
+/// Thin wrapper around http package that injects the bearer token,
+/// retries once on a 401 using the refresh token, and decodes JSON.
+class ApiClient {
+  ApiClient._internal();
+  static final ApiClient instance = ApiClient._internal();
+
+  final _storage = const FlutterSecureStorage();
+  final _client = http.Client();
+
+  Future<String?> get _accessToken => _storage.read(key: StorageKeys.accessToken);
+  Future<String?> get _refreshToken => _storage.read(key: StorageKeys.refreshToken);
+
+  Future<void> saveTokens({required String access, required String refresh}) async {
+    await _storage.write(key: StorageKeys.accessToken, value: access);
+    await _storage.write(key: StorageKeys.refreshToken, value: refresh);
+  }
+
+  Future<void> clearTokens() async {
+    await _storage.delete(key: StorageKeys.accessToken);
+    await _storage.delete(key: StorageKeys.refreshToken);
+  }
+
+  Future<bool> get isLoggedIn async => (await _accessToken) != null;
+
+  Uri _uri(String path, [Map<String, dynamic>? query]) {
+    final base = Uri.parse(ApiConfig.baseUrl + path);
+    if (query == null) return base;
+    return base.replace(queryParameters: {
+      ...base.queryParameters,
+      ...query.map((k, v) => MapEntry(k, v.toString())),
+    });
+  }
+
+  Future<Map<String, String>> _headers({bool auth = true}) async {
+    final headers = {'Content-Type': 'application/json'};
+    if (auth) {
+      final token = await _accessToken;
+      if (token != null) headers['Authorization'] = 'Bearer $token';
+    }
+    return headers;
+  }
+
+  Future<bool> _tryRefresh() async {
+    final refresh = await _refreshToken;
+    if (refresh == null) return false;
+    final resp = await _client.post(
+      _uri('/auth/refresh'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $refresh',
+      },
+    );
+    if (resp.statusCode == 200) {
+      final body = jsonDecode(resp.body);
+      await _storage.write(key: StorageKeys.accessToken, value: body['access_token']);
+      return true;
+    }
+    return false;
+  }
+
+  dynamic _decode(http.Response resp) {
+    if (resp.body.isEmpty) return null;
+    try {
+      return jsonDecode(resp.body);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<dynamic> _handle(http.Response resp) async {
+    if (resp.statusCode >= 200 && resp.statusCode < 300) {
+      return _decode(resp);
+    }
+    final body = _decode(resp);
+    throw ApiException(
+      body?['error'] ?? body?['errors']?.toString() ?? 'Request failed (${resp.statusCode})',
+      statusCode: resp.statusCode,
+      errors: body?['errors'] is Map ? Map<String, dynamic>.from(body['errors']) : null,
+    );
+  }
+
+  Future<dynamic> get(String path, {Map<String, dynamic>? query, bool auth = true}) async {
+    var resp = await _client
+        .get(_uri(path, query), headers: await _headers(auth: auth))
+        .timeout(ApiConfig.requestTimeout);
+    if (resp.statusCode == 401 && auth && await _tryRefresh()) {
+      resp = await _client
+          .get(_uri(path, query), headers: await _headers(auth: auth))
+          .timeout(ApiConfig.requestTimeout);
+    }
+    return _handle(resp);
+  }
+
+  Future<dynamic> post(String path, {Object? body, bool auth = true}) async {
+    var resp = await _client
+        .post(_uri(path), headers: await _headers(auth: auth), body: jsonEncode(body ?? {}))
+        .timeout(ApiConfig.requestTimeout);
+    if (resp.statusCode == 401 && auth && await _tryRefresh()) {
+      resp = await _client
+          .post(_uri(path), headers: await _headers(auth: auth), body: jsonEncode(body ?? {}))
+          .timeout(ApiConfig.requestTimeout);
+    }
+    return _handle(resp);
+  }
+
+  Future<dynamic> put(String path, {Object? body, bool auth = true}) async {
+    final resp = await _client
+        .put(_uri(path), headers: await _headers(auth: auth), body: jsonEncode(body ?? {}))
+        .timeout(ApiConfig.requestTimeout);
+    return _handle(resp);
+  }
+
+  Future<dynamic> delete(String path, {bool auth = true}) async {
+    final resp = await _client
+        .delete(_uri(path), headers: await _headers(auth: auth))
+        .timeout(ApiConfig.requestTimeout);
+    return _handle(resp);
+  }
+
+  /// Multipart upload for OCR image analysis.
+  Future<dynamic> postMultipart(
+    String path, {
+    required List<int> fileBytes,
+    required String filename,
+    Map<String, String>? fields,
+  }) async {
+    final token = await _accessToken;
+    final request = http.MultipartRequest('POST', _uri(path));
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    if (fields != null) request.fields.addAll(fields);
+    request.files.add(http.MultipartFile.fromBytes('image', fileBytes, filename: filename));
+
+    final streamed = await _client.send(request).timeout(const Duration(seconds: 30));
+    final resp = await http.Response.fromStream(streamed);
+    return _handle(resp);
+  }
+
+  /// Multipart upload for the two-photo OCR flow (ingredients + nutrition
+  /// table). [files] maps the multipart field name (matching what the
+  /// Flask route expects, e.g. 'ingredients_image', 'nutrition_image')
+  /// to that file's raw bytes and filename.
+  Future<dynamic> postMultipartFiles(
+    String path, {
+    required Map<String, ({List<int> bytes, String filename})> files,
+    Map<String, String>? fields,
+  }) async {
+    final token = await _accessToken;
+    final request = http.MultipartRequest('POST', _uri(path));
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    if (fields != null) request.fields.addAll(fields);
+    for (final entry in files.entries) {
+      request.files.add(http.MultipartFile.fromBytes(
+        entry.key,
+        entry.value.bytes,
+        filename: entry.value.filename,
+      ));
+    }
+
+    final streamed = await _client.send(request).timeout(const Duration(seconds: 30));
+    final resp = await http.Response.fromStream(streamed);
+    return _handle(resp);
+  }
+}
+
+
+===== FILE: lib\core\constants.dart =====
+/// Central place to configure the backend base URL per build target.
+///
+/// Override at build/run time with:
+///   flutter run --dart-define=API_BASE_URL=http://192.168.1.10:5000/api
+///   flutter build apk --dart-define=API_BASE_URL=https://api.nutricheck.app/api
+class ApiConfig {
+  ApiConfig._();
+
+  static const String baseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    // Android emulator loopback to host machine's localhost:5000.
+    // Use your machine's LAN IP for a physical device, and your real
+    // domain for production.
+    defaultValue: 'http://localhost:5000/api',
+  );
+
+  static const Duration requestTimeout = Duration(seconds: 20);
+}
+
+class StorageKeys {
+  StorageKeys._();
+  static const accessToken = 'nutricheck_access_token';
+  static const refreshToken = 'nutricheck_refresh_token';
+  static const userProfile = 'nutricheck_user_profile';
+}
+
+
+===== FILE: lib\core\theme.dart =====
+import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
+
+/// Design tokens ported 1:1 from the original NutriCheck Figma spec
+/// (src/index.css --color-* variables).
+class AppColors {
+  AppColors._();
+
+  static const greenPrimary = Color(0xFF176B45);
+  static const greenLight = Color(0xFFE8F5EE);
+  static const greenMid = Color(0xFF2D9264);
+   static const amber = Color(0xFFF59E0B);
+  static const amberLight = Color(0xFFFEF3C7);
+  static const orange = Color(0xFFF97316);
+  static const orangeLight = Color(0xFFFFEDD5);
+  static const red = Color(0xFFEF4444);
+  static const redLight = Color(0xFFFEE2E2);
+  static const bg = Color(0xFFF7F9F7);
+  static const surface = Color(0xFFFFFFFF);
+  static const ink = Color(0xFF1A1A1A);
+  static const muted = Color(0xFF6B7280);
+  static const border = Color(0xFFE5E7EB);
+  static const outerBg = Color(0xFFE8EAE8);
+}
+
+const double kCardRadius = 16.0;
+
+class AppTheme {
+  AppTheme._();
+
+  static ThemeData get light {
+    final displayFont = GoogleFonts.outfitTextTheme();
+    final bodyFont = GoogleFonts.interTextTheme();
+
+    return ThemeData(
+      useMaterial3: true,
+      scaffoldBackgroundColor: AppColors.bg,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: AppColors.greenPrimary,
+        primary: AppColors.greenPrimary,
+        secondary: AppColors.greenMid,
+        error: AppColors.red,
+        surface: AppColors.surface,
+      ),
+      fontFamily: bodyFont.bodyMedium?.fontFamily,
+      textTheme: bodyFont.copyWith(
+        displayLarge: displayFont.displayLarge,
+        displayMedium: displayFont.displayMedium,
+        displaySmall: displayFont.displaySmall,
+        headlineLarge: displayFont.headlineLarge,
+        headlineMedium: displayFont.headlineMedium,
+        headlineSmall: displayFont.headlineSmall,
+        titleLarge: displayFont.titleLarge,
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: AppColors.bg,
+        foregroundColor: AppColors.ink,
+        elevation: 0,
+        centerTitle: false,
+      ),
+      cardTheme: CardThemeData(
+        color: AppColors.surface,
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(kCardRadius),
+          side: const BorderSide(color: AppColors.border),
+        ),
+      ),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: AppColors.greenPrimary,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: AppColors.surface,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: AppColors.border),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: AppColors.border),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: AppColors.greenPrimary, width: 1.5),
+        ),
+      ),
+    );
+  }
+}
+
+/// Status colors for suitability badges (suitable / caution / avoid).
+class StatusStyle {
+  final Color bg;
+  final Color fg;
+  const StatusStyle(this.bg, this.fg);
+
+  static StatusStyle forStatus(String status) {
+    switch (status.toLowerCase()) {
+      case 'suitable':
+      case 'generally suitable':
+        return const StatusStyle(AppColors.greenLight, AppColors.greenPrimary);
+      case 'caution':
+      case 'use caution':
+        return const StatusStyle(AppColors.amberLight, AppColors.amber);
+      case 'limit':
+        return const StatusStyle(AppColors.orangeLight, AppColors.orange);
+      case 'avoid':
+        return const StatusStyle(AppColors.redLight, AppColors.red);
+      default:
+        return const StatusStyle(AppColors.border, AppColors.muted);
+    }
+  }
+}
+
+
+===== FILE: lib\models\analysis_result.dart =====
+class AgeGroupResult {
+  final String group; // Child / Teenager / Adult
+  final String status; // suitable / caution / avoid
+  final String reason;
+
+  AgeGroupResult({required this.group, required this.status, required this.reason});
+
+  factory AgeGroupResult.fromJson(Map<String, dynamic> json) => AgeGroupResult(
+        group: json['group'] ?? '',
+        status: json['status'] ?? 'suitable',
+        reason: json['reason'] ?? '',
+      );
+}
+
+class IngredientFlag {
+  final String ingredient;
+  final String concern;
+  IngredientFlag({required this.ingredient, required this.concern});
+
+  factory IngredientFlag.fromJson(Map<String, dynamic> json) => IngredientFlag(
+        ingredient: json['ingredient'] ?? '',
+        concern: json['concern'] ?? '',
+      );
+}
+
+class NutritionConcern {
+  final String label;
+  final String value;
+  final String concern;
+  NutritionConcern({required this.label, required this.value, required this.concern});
+
+  factory NutritionConcern.fromJson(Map<String, dynamic> json) => NutritionConcern(
+        label: json['label'] ?? '',
+        value: json['value'] ?? '',
+        concern: json['concern'] ?? '',
+      );
+}
+
+/// NEW - one product-level warning for a given health condition
+/// (e.g. Diabetes -> Avoid -> "High sugar content"). This is a
+/// PRODUCT WARNING, never a diagnosis of the person using the app.
+class HealthConditionWarning {
+  final String conditionName;
+  final String severity; // Safe / Caution / Avoid
+  final String reason;
+  final String recommendation;
+
+  HealthConditionWarning({
+    required this.conditionName,
+    required this.severity,
+    required this.reason,
+    required this.recommendation,
+  });
+
+  factory HealthConditionWarning.fromJson(Map<String, dynamic> json) => HealthConditionWarning(
+        conditionName: json['condition_name'] ?? '',
+        severity: json['severity'] ?? 'Caution',
+        reason: json['reason'] ?? '',
+        recommendation: json['recommendation'] ?? '',
+      );
+}
+
+class AnalysisResult {
+  final String overall; // Generally Suitable / Use Caution / Avoid
+  final List<AgeGroupResult> ageGroups;
+  final List<IngredientFlag> flags;
+  final List<NutritionConcern> nutritionConcerns;
+  final List<HealthConditionWarning> healthConditions; // NEW - defaults to [] if absent
+
+  AnalysisResult({
+    required this.overall,
+    required this.ageGroups,
+    required this.flags,
+    required this.nutritionConcerns,
+    this.healthConditions = const [],
+  });
+
+  factory AnalysisResult.fromJson(Map<String, dynamic> json) => AnalysisResult(
+        overall: json['overall'] ?? 'Generally Suitable',
+        ageGroups: (json['age_groups'] as List? ?? [])
+            .map((e) => AgeGroupResult.fromJson(e))
+            .toList(),
+        flags: (json['flags'] as List? ?? [])
+            .map((e) => IngredientFlag.fromJson(e))
+            .toList(),
+        nutritionConcerns: (json['nutrition_concerns'] as List? ?? [])
+            .map((e) => NutritionConcern.fromJson(e))
+            .toList(),
+        // Safe even if the backend hasn't been updated yet, or the key
+        // is missing/null - always resolves to an empty list, never crashes.
+        healthConditions: (json['health_conditions'] as List? ?? [])
+            .map((e) => HealthConditionWarning.fromJson(e))
+            .toList(),
+      );
+}
+
+===== FILE: lib\models\history_item.dart =====
+import 'analysis_result.dart';
+
+class HistoryItem {
+  final String id;
+  final String source; // barcode / ocr
+  final String productName;
+  final String brand;
+  final String image;
+  final String barcode;
+  final String overall;
+  final List<AgeGroupResult> ageGroups;
+  final List<IngredientFlag> flags;
+  final List<HealthConditionWarning> healthConditions;
+  final DateTime createdAt;
+
+  HistoryItem({
+    required this.id,
+    required this.source,
+    required this.productName,
+    required this.brand,
+    required this.image,
+    required this.barcode,
+    required this.overall,
+    required this.ageGroups,
+    required this.flags,
+    required this.createdAt,
+    this.healthConditions = const [],
+  });
+
+  factory HistoryItem.fromJson(Map<String, dynamic> json) => HistoryItem(
+        id: json['id'] ?? '',
+        source: json['source'] ?? 'barcode',
+        productName: json['product_name'] ?? 'Unknown',
+        brand: json['brand'] ?? '',
+        image: json['image'] ?? '',
+        barcode: json['barcode'] ?? '',
+        overall: json['overall'] ?? 'Generally Suitable',
+        ageGroups: (json['age_groups'] as List? ?? [])
+            .map((e) => AgeGroupResult.fromJson(e))
+            .toList(),
+        flags: (json['flags'] as List? ?? [])
+            .map((e) => IngredientFlag.fromJson(e))
+            .toList(),
+        // Safe even for older history entries saved before this feature
+        // existed - missing/null key resolves to an empty list.
+        healthConditions: (json['health_conditions'] as List? ?? [])
+            .map((e) => HealthConditionWarning.fromJson(e))
+            .toList(),
+        createdAt: DateTime.tryParse(json['created_at'] ?? '') ?? DateTime.now(),
+      );
+}
+
+===== FILE: lib\models\product.dart =====
+class NutritionInfo {
+  final String energy;
+  final String fat;
+  final String saturatedFat;
+  final String carbs;
+  final String sugars;
+  final String fiber;
+  final String protein;
+  final String salt;
+
+  NutritionInfo({
+    this.energy = '0',
+    this.fat = '0g',
+    this.saturatedFat = '0g',
+    this.carbs = '0g',
+    this.sugars = '0g',
+    this.fiber = '0g',
+    this.protein = '0g',
+    this.salt = '0g',
+  });
+
+  factory NutritionInfo.fromJson(Map<String, dynamic> json) => NutritionInfo(
+        energy: json['energy']?.toString() ?? '0',
+        fat: json['fat']?.toString() ?? '0g',
+        saturatedFat: json['saturatedFat']?.toString() ?? '0g',
+        carbs: json['carbs']?.toString() ?? '0g',
+        sugars: json['sugars']?.toString() ?? '0g',
+        fiber: json['fiber']?.toString() ?? '0g',
+        protein: json['protein']?.toString() ?? '0g',
+        salt: json['salt']?.toString() ?? '0g',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'energy': energy,
+        'fat': fat,
+        'saturatedFat': saturatedFat,
+        'carbs': carbs,
+        'sugars': sugars,
+        'fiber': fiber,
+        'protein': protein,
+        'salt': salt,
+      };
+
+  List<MapEntry<String, String>> get entries => [
+        MapEntry('Energy', energy),
+        MapEntry('Fat', fat),
+        MapEntry('Saturated Fat', saturatedFat),
+        MapEntry('Carbohydrates', carbs),
+        MapEntry('Sugars', sugars),
+        MapEntry('Fiber', fiber),
+        MapEntry('Protein', protein),
+        MapEntry('Salt', salt),
+      ];
+}
+
+class Product {
+  final String barcode;
+  final String name;
+  final String brand;
+  final String category;
+  final String image;
+  final String ingredients;
+  final NutritionInfo nutrition;
+
+  Product({
+    required this.barcode,
+    required this.name,
+    required this.brand,
+    required this.category,
+    required this.image,
+    required this.ingredients,
+    required this.nutrition,
+  });
+
+  factory Product.fromJson(Map<String, dynamic> json) => Product(
+        barcode: json['barcode'] ?? '',
+        name: json['name'] ?? 'Unknown Product',
+        brand: json['brand'] ?? '',
+        category: json['category'] ?? '',
+        image: json['image'] ?? '',
+        ingredients: json['ingredients'] ?? '',
+        nutrition: NutritionInfo.fromJson(json['nutrition'] ?? {}),
+      );
+}
+
+
+===== FILE: lib\models\user_profile.dart =====
+class UserProfile {
+  final String id;
+  final String name;
+  final String email;
+  final int age;
+  final String ageGroup;
+
+  UserProfile({
+    required this.id,
+    required this.name,
+    required this.email,
+    required this.age,
+    required this.ageGroup,
+  });
+
+  factory UserProfile.fromJson(Map<String, dynamic> json) => UserProfile(
+        id: json['id'] ?? '',
+        name: json['name'] ?? '',
+        email: json['email'] ?? '',
+        age: json['age'] ?? 0,
+        ageGroup: json['age_group'] ?? 'Adult',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'email': email,
+        'age': age,
+        'age_group': ageGroup,
+      };
+}
+
+
+===== FILE: lib\providers\auth_provider.dart =====
+import 'package:flutter/foundation.dart';
+import '../core/api_client.dart';
+import '../models/user_profile.dart';
+import '../services/auth_service.dart';
+
+enum AuthStatus { unknown, authenticated, unauthenticated }
+
+class AuthProvider extends ChangeNotifier {
+  final _authService = AuthService();
+
+  AuthStatus status = AuthStatus.unknown;
+  UserProfile? profile;
+  String? errorMessage;
+  bool isLoading = false;
+
+  Future<void> bootstrap() async {
+    final loggedIn = await ApiClient.instance.isLoggedIn;
+    if (!loggedIn) {
+      status = AuthStatus.unauthenticated;
+      notifyListeners();
+      return;
+    }
+    try {
+      profile = await _authService.fetchMe();
+      status = AuthStatus.authenticated;
+    } catch (_) {
+      status = AuthStatus.unauthenticated;
+    }
+    notifyListeners();
+  }
+
+  Future<bool> register({
+    required String name,
+    required String email,
+    required String password,
+    required int age,
+  }) => _run(() async {
+        profile = await _authService.register(name: name, email: email, password: password, age: age);
+        status = AuthStatus.authenticated;
+      });
+
+  Future<bool> login({required String email, required String password}) => _run(() async {
+        profile = await _authService.login(email: email, password: password);
+        status = AuthStatus.authenticated;
+      });
+
+  Future<bool> updateProfile({String? name, int? age}) => _run(() async {
+        profile = await _authService.updateProfile(name: name, age: age);
+      });
+
+  Future<void> logout() async {
+    await _authService.logout();
+    profile = null;
+    status = AuthStatus.unauthenticated;
+    notifyListeners();
+  }
+
+  Future<bool> _run(Future<void> Function() action) async {
+    isLoading = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      await action();
+      isLoading = false;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      isLoading = false;
+      errorMessage = e.toString();
+      notifyListeners();
+      return false;
+    }
+  }
+}
+
+
+===== FILE: lib\providers\history_provider.dart =====
+import 'package:flutter/foundation.dart';
+import '../models/history_item.dart';
+import '../services/history_service.dart';
+
+class HistoryProvider extends ChangeNotifier {
+  final _service = HistoryService();
+
+  List<HistoryItem> items = [];
+  bool isLoading = false;
+  String? errorMessage;
+
+  Future<void> load() async {
+    isLoading = true;
+    errorMessage = null;
+    notifyListeners();
+    try {
+      items = await _service.list();
+    } catch (e) {
+      errorMessage = e.toString();
+    }
+    isLoading = false;
+    notifyListeners();
+  }
+
+  Future<void> delete(String id) async {
+    await _service.delete(id);
+    items.removeWhere((i) => i.id == id);
+    notifyListeners();
+  }
+
+  Future<void> clearAll() async {
+    await _service.clearAll();
+    items = [];
+    notifyListeners();
+  }
+}
+
+
+===== FILE: lib\providers\scan_provider.dart =====
+import 'package:flutter/foundation.dart';
+import '../models/product.dart';
+import '../models/analysis_result.dart';
+import '../services/product_service.dart';
+import '../services/analysis_service.dart';
+
+enum ScanStage {
+  idle,
+  lookingUpProduct,
+  notFound,
+  analyzing,
+  result,
+  error,
+  awaitingNutritionPhoto, // NEW - ingredients captured, prompting for nutrition photo
+}
+
+/// Drives the barcode-scan -> product-detail -> analyzing -> result flow,
+/// and the OCR-camera -> review -> analyzing -> result flow.
+class ScanProvider extends ChangeNotifier {
+  final _productService = ProductService();
+  final _analysisService = AnalysisService();
+
+  ScanStage stage = ScanStage.idle;
+  String category = 'food'; // 'food' | 'drinks'
+  Product? product;
+  AnalysisResult? result;
+  String? ocrIngredientsText;
+  String? errorMessage;
+  String? lastBarcode;
+
+  // NEW - holds the ingredients photo while the user is prompted to also
+  // capture the nutrition table. Cleared once the two-photo analysis
+  // completes (success or failure) or the flow is reset.
+  Uint8List? pendingIngredientsImage;
+
+  // NEW - when the OCR flow is started from a known product (e.g. a
+  // barcode-resolved product with missing ingredients/nutrition), this
+  // carries the product's real name through to the OCR result/history
+  // instead of the generic "Scanned Label" fallback.
+  String? productNameOverride;
+
+  void setCategory(String value) {
+    category = value;
+    notifyListeners();
+  }
+
+  void reset() {
+    stage = ScanStage.idle;
+    product = null;
+    result = null;
+    ocrIngredientsText = null;
+    errorMessage = null;
+    pendingIngredientsImage = null;
+    productNameOverride = null;
+    notifyListeners();
+  }
+
+  Future<void> lookupBarcode(String barcode) async {
+    lastBarcode = barcode;
+    stage = ScanStage.lookingUpProduct;
+    notifyListeners();
+    try {
+      product = await _productService.lookupBarcode(barcode);
+      stage = ScanStage.idle; // caller navigates to product-detail screen
+      notifyListeners();
+    } on ProductNotFoundException {
+      stage = ScanStage.notFound;
+      notifyListeners();
+    } catch (e) {
+      errorMessage = e.toString();
+      stage = ScanStage.error;
+      notifyListeners();
+    }
+  }
+
+  Future<void> analyzeCurrentProduct() async {
+    if (product == null) return;
+    stage = ScanStage.analyzing;
+    notifyListeners();
+    try {
+      result = await _analysisService.analyzeProduct(product!, category: category);
+      stage = ScanStage.result;
+    } catch (e) {
+      errorMessage = e.toString();
+      stage = ScanStage.error;
+    }
+    notifyListeners();
+  }
+
+  Future<void> analyzeOcrImage(Uint8List imageBytes) async {
+    stage = ScanStage.analyzing;
+    notifyListeners();
+    try {
+      final outcome = await _analysisService.analyzeImage(
+        imageBytes,
+        category: category,
+        productName: productNameOverride ?? 'Scanned Label',
+      );
+      result = outcome.result;
+      ocrIngredientsText = outcome.ingredientsText;
+      stage = ScanStage.result;
+    } catch (e) {
+      errorMessage = e.toString();
+      stage = ScanStage.error;
+    }
+    notifyListeners();
+  }
+
+  /// NEW - Step 1 of the two-photo flow: store the reviewed ingredients
+  /// photo and move to the "now scan nutrition" prompt, without calling
+  /// the backend yet.
+  void submitIngredientsPhoto(Uint8List imageBytes) {
+    pendingIngredientsImage = imageBytes;
+    stage = ScanStage.awaitingNutritionPhoto;
+    notifyListeners();
+  }
+
+  /// NEW - Step 2 of the two-photo flow: send both photos together.
+  /// [nutritionImageBytes] is optional - if the user skips it, analysis
+  /// proceeds with ingredients only.
+  Future<void> analyzeTwoImages({Uint8List? nutritionImageBytes}) async {
+    if (pendingIngredientsImage == null) return;
+    stage = ScanStage.analyzing;
+    notifyListeners();
+    try {
+          final outcome = await _analysisService.analyzeTwoImages(
+        pendingIngredientsImage!,
+        nutritionImageBytes: nutritionImageBytes,
+        category: category,
+        productName: productNameOverride ?? 'Scanned Label',
+      );
+      result = outcome.result;
+      ocrIngredientsText = outcome.ingredientsText;
+      stage = ScanStage.result;
+    } catch (e) {
+      errorMessage = e.toString();
+      stage = ScanStage.error;
+    }
+    pendingIngredientsImage = null;
+    notifyListeners();
+  }
+}
+
+===== FILE: lib\screens\auth\login_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../../core/theme.dart';
+import '../../providers/auth_provider.dart';
+import '../home_screen.dart';
+import 'register_screen.dart';
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailCtrl = TextEditingController();
+  final _passwordCtrl = TextEditingController();
+  bool _obscure = true;
+
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passwordCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    final auth = context.read<AuthProvider>();
+    final ok = await auth.login(email: _emailCtrl.text.trim(), password: _passwordCtrl.text);
+    if (!mounted) return;
+    if (ok) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (route) => false,
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(auth.errorMessage ?? 'Login failed')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Form(
+            key: _formKey,
+            child: ListView(
+              children: [
+                const SizedBox(height: 40),
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: AppColors.greenLight,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: const Icon(Icons.eco_rounded, color: AppColors.greenPrimary, size: 32),
+                ),
+                const SizedBox(height: 20),
+                const Text('Welcome back',
+                    style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700, color: AppColors.ink)),
+                const SizedBox(height: 6),
+                const Text('Sign in to continue to NutriCheck',
+                    style: TextStyle(color: AppColors.muted, fontSize: 14)),
+                const SizedBox(height: 28),
+                TextFormField(
+                  controller: _emailCtrl,
+                  keyboardType: TextInputType.emailAddress,
+                  decoration: const InputDecoration(labelText: 'Email'),
+                  validator: (v) => (v == null || !v.contains('@')) ? 'Enter a valid email' : null,
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _passwordCtrl,
+                  obscureText: _obscure,
+                  decoration: InputDecoration(
+                    labelText: 'Password',
+                    suffixIcon: IconButton(
+                      icon: Icon(_obscure ? Icons.visibility_off_outlined : Icons.visibility_outlined),
+                      onPressed: () => setState(() => _obscure = !_obscure),
+                    ),
+                  ),
+                  validator: (v) => (v == null || v.length < 6) ? 'Minimum 6 characters' : null,
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: auth.isLoading ? null : _submit,
+                  child: auth.isLoading
+                      ? const SizedBox(
+                          height: 20, width: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Text('Sign In'),
+                ),
+                const SizedBox(height: 16),
+                Center(
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const RegisterScreen()),
+                    ),
+                    child: const Text("Don't have an account? Create one"),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\auth\register_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../../core/theme.dart';
+import '../../providers/auth_provider.dart';
+import '../home_screen.dart';
+
+class RegisterScreen extends StatefulWidget {
+  const RegisterScreen({super.key});
+
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameCtrl = TextEditingController();
+  final _emailCtrl = TextEditingController();
+  final _ageCtrl = TextEditingController();
+  final _passwordCtrl = TextEditingController();
+  bool _obscure = true;
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _emailCtrl.dispose();
+    _ageCtrl.dispose();
+    _passwordCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    final auth = context.read<AuthProvider>();
+    final ok = await auth.register(
+      name: _nameCtrl.text.trim(),
+      email: _emailCtrl.text.trim(),
+      password: _passwordCtrl.text,
+      age: int.parse(_ageCtrl.text.trim()),
+    );
+    if (!mounted) return;
+    if (ok) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (route) => false,
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(auth.errorMessage ?? 'Registration failed')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Create your profile')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Form(
+            key: _formKey,
+            child: ListView(
+              children: [
+                const SizedBox(height: 8),
+                const Text('Tell us about yourself',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.ink)),
+                const SizedBox(height: 6),
+                const Text(
+                  "We use your age to tailor suitability guidance for you.",
+                  style: TextStyle(color: AppColors.muted, fontSize: 14),
+                ),
+                const SizedBox(height: 24),
+                TextFormField(
+                  controller: _nameCtrl,
+                  decoration: const InputDecoration(labelText: 'Full name'),
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Name is required' : null,
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _emailCtrl,
+                  keyboardType: TextInputType.emailAddress,
+                  decoration: const InputDecoration(labelText: 'Email'),
+                  validator: (v) => (v == null || !v.contains('@')) ? 'Enter a valid email' : null,
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _ageCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Age'),
+                  validator: (v) {
+                    final n = int.tryParse(v ?? '');
+                    if (n == null || n < 1 || n > 120) return 'Enter a valid age';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _passwordCtrl,
+                  obscureText: _obscure,
+                  decoration: InputDecoration(
+                    labelText: 'Password',
+                    suffixIcon: IconButton(
+                      icon: Icon(_obscure ? Icons.visibility_off_outlined : Icons.visibility_outlined),
+                      onPressed: () => setState(() => _obscure = !_obscure),
+                    ),
+                  ),
+                  validator: (v) => (v == null || v.length < 6) ? 'Minimum 6 characters' : null,
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: auth.isLoading ? null : _submit,
+                  child: auth.isLoading
+                      ? const SizedBox(
+                          height: 20, width: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Text('Continue'),
+                ),
+                const SizedBox(height: 24),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\analyzing_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/scan_provider.dart';
+import 'result_screen.dart';
+
+class AnalyzingScreen extends StatefulWidget {
+  const AnalyzingScreen({super.key});
+
+  @override
+  State<AnalyzingScreen> createState() => _AnalyzingScreenState();
+}
+
+class _AnalyzingScreenState extends State<AnalyzingScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _run());
+  }
+
+  Future<void> _run() async {
+    final scan = context.read<ScanProvider>();
+    await scan.analyzeCurrentProduct();
+    if (!mounted) return;
+    if (scan.stage == ScanStage.result) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ResultScreen()),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(scan.errorMessage ?? 'Analysis failed')),
+      );
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 96,
+              height: 96,
+              decoration: const BoxDecoration(color: AppColors.greenLight, shape: BoxShape.circle),
+              child: const Padding(
+                padding: EdgeInsets.all(24),
+                child: CircularProgressIndicator(color: AppColors.greenPrimary, strokeWidth: 3),
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text('Analyzing ingredientsâ€¦',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: AppColors.ink)),
+            const SizedBox(height: 8),
+            const Text('Checking suitability for all age groups',
+                style: TextStyle(color: AppColors.muted, fontSize: 13)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\history_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/history_provider.dart';
+import '../widgets/history_card.dart';
+import 'result_screen.dart';
+
+class HistoryScreen extends StatefulWidget {
+  final bool embedded;
+  const HistoryScreen({super.key, this.embedded = false});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<HistoryProvider>().load();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final history = context.watch<HistoryProvider>();
+
+    final body = RefreshIndicator(
+      onRefresh: () => context.read<HistoryProvider>().load(),
+      child: history.isLoading && history.items.isEmpty
+          ? const Center(child: CircularProgressIndicator())
+          : history.items.isEmpty
+              ? ListView(
+                  children: const [
+                    SizedBox(height: 120),
+                    Icon(Icons.inventory_2_outlined, color: AppColors.muted, size: 40),
+                    SizedBox(height: 12),
+                    Center(
+                        child: Text('No scan history yet',
+                            style: TextStyle(color: AppColors.muted, fontWeight: FontWeight.w600))),
+                  ],
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                  itemCount: history.items.length,
+                  itemBuilder: (context, i) {
+                    final item = history.items[i];
+                    return HistoryCard(
+                      item: item,
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => ResultScreenFromHistory(item: item)),
+                      ),
+                      onDismiss: () => context.read<HistoryProvider>().delete(item.id),
+                    );
+                  },
+                ),
+    );
+
+    if (widget.embedded) {
+      return Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('Scan History', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.ink)),
+                if (history.items.isNotEmpty)
+                  TextButton(
+                    onPressed: () => context.read<HistoryProvider>().clearAll(),
+                    child: const Text('Clear all'),
+                  ),
+              ],
+            ),
+          ),
+          Expanded(child: body),
+        ],
+      );
+    }
+
+    return Scaffold(appBar: AppBar(title: const Text('Scan History')), body: body);
+  }
+}
+
+
+===== FILE: lib\screens\home_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/auth_provider.dart';
+import '../providers/history_provider.dart';
+import '../widgets/bottom_nav.dart';
+import '../widgets/history_card.dart';
+import 'scan_screen.dart';
+import 'history_screen.dart';
+import 'profile_view_screen.dart';
+import 'result_screen.dart';
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int _navIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<HistoryProvider>().load();
+    });
+  }
+
+  /// Single entry point into the scan flow. Food and Drinks are now one
+  /// combined category, so this always opens the scanner with the
+  /// 'food' category (the backend's nutrition-analyzer default) -
+  /// no functionality is lost, just the extra choice screen.
+  void _openScan() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const ScanScreen(initialCategory: 'food')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      _buildHomeBody(context),
+      const HistoryScreen(embedded: true),
+      const ProfileViewScreen(embedded: true),
+    ];
+
+    Widget body;
+    switch (_navIndex) {
+      case 1:
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          setState(() => _navIndex = 0);
+          _openScan();
+        });
+        body = pages[0];
+        break;
+      case 2:
+        body = pages[1];
+        break;
+      case 3:
+        body = pages[2];
+        break;
+      default:
+        body = pages[0];
+    }
+
+    return Scaffold(
+      body: SafeArea(child: body),
+      bottomNavigationBar: AppBottomNav(
+        currentIndex: _navIndex,
+        onChanged: (i) => setState(() => _navIndex = i),
+      ),
+    );
+  }
+
+  Widget _buildHomeBody(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    final history = context.watch<HistoryProvider>();
+    final name = auth.profile?.name.split(' ').first ?? '';
+
+    return RefreshIndicator(
+      onRefresh: () => context.read<HistoryProvider>().load(),
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Hi there,', style: TextStyle(color: AppColors.muted, fontSize: 14)),
+                  Text(name.isEmpty ? 'Welcome' : name,
+                      style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppColors.ink)),
+                ],
+              ),
+              Container(
+                width: 44,
+                height: 44,
+                decoration: const BoxDecoration(color: AppColors.greenLight, shape: BoxShape.circle),
+                child: const Icon(Icons.person_rounded, color: AppColors.greenPrimary),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+
+          // Single merged "Food & Drinks" entry point - replaces the old
+          // separate "Scan a product" hero card plus Food/Drink tiles.
+          InkWell(
+            onTap: _openScan,
+            borderRadius: BorderRadius.circular(20),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: AppColors.greenPrimary,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 56,
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: const Icon(Icons.restaurant_rounded, color: Colors.white, size: 28),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Food & Drinks',
+                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 18)),
+                        const SizedBox(height: 4),
+                        const Text(
+                          'Scan a barcode or enter it manually to get instant guidance',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Icon(Icons.qr_code_scanner_rounded, color: Colors.white, size: 32),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Recent scans', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+              TextButton(
+                onPressed: () => setState(() => _navIndex = 2),
+                child: const Text('See all'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (history.isLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (history.items.isEmpty)
+            _emptyState()
+          else
+            ...history.items.take(5).map((item) => HistoryCard(
+                  item: item,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => ResultScreenFromHistory(item: item)),
+                  ),
+                )),
+        ],
+      ),
+    );
+  }
+
+  Widget _emptyState() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: const Column(
+        children: [
+          Icon(Icons.inventory_2_outlined, color: AppColors.muted, size: 32),
+          SizedBox(height: 10),
+          Text('No scans yet', style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.ink)),
+          SizedBox(height: 4),
+          Text('Scan a barcode or label to get started',
+              style: TextStyle(color: AppColors.muted, fontSize: 12), textAlign: TextAlign.center),
+        ],
+      ),
+    );
+  }
+}
+
+===== FILE: lib\screens\not_found_screen.dart =====
+import 'package:flutter/material.dart';
+import '../core/theme.dart';
+import 'ocr_camera_screen.dart';
+
+class NotFoundScreen extends StatelessWidget {
+  final String barcode;
+  const NotFoundScreen({super.key, required this.barcode});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Product Not Found')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 88,
+              height: 88,
+              decoration: const BoxDecoration(color: AppColors.amberLight, shape: BoxShape.circle),
+              child: const Icon(Icons.search_off_rounded, color: AppColors.amber, size: 40),
+            ),
+            const SizedBox(height: 20),
+            const Text('No product found',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: AppColors.ink)),
+            const SizedBox(height: 8),
+            Text(
+              "We couldn't find barcode $barcode in the product database. "
+              "You can instead scan the ingredients label directly.",
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.muted, height: 1.5),
+            ),
+            const SizedBox(height: 28),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.document_scanner_outlined),
+              label: const Text('Scan Ingredients Label'),
+              onPressed: () {
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(builder: (_) => const OcrCameraScreen()),
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Try scanning again'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\nutrition_photo_prompt_screen.dart =====
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:image_cropper/image_cropper.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/scan_provider.dart';
+import 'ocr_review_screen.dart';
+import 'result_screen.dart';
+
+/// Shown after the ingredients photo is confirmed. Prompts the user to
+/// also scan the nutrition table (optional - "Skip" analyzes with
+/// ingredients only, matching the backend's optional nutrition_image).
+class NutritionPhotoPromptScreen extends StatefulWidget {
+  const NutritionPhotoPromptScreen({super.key});
+
+  @override
+  State<NutritionPhotoPromptScreen> createState() => _NutritionPhotoPromptScreenState();
+}
+
+class _NutritionPhotoPromptScreenState extends State<NutritionPhotoPromptScreen> {
+  final _picker = ImagePicker();
+  bool _busy = false;
+
+  Future<void> _capture(ImageSource source) async {
+    setState(() => _busy = true);
+    try {
+      final file = await _picker.pickImage(source: source, imageQuality: 90);
+      if (file == null) {
+        setState(() => _busy = false);
+        return;
+      }
+
+      final cropped = await ImageCropper().cropImage(
+        sourcePath: file.path,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Crop Nutrition Table',
+            toolbarColor: AppColors.greenPrimary,
+            toolbarWidgetColor: Colors.white,
+            lockAspectRatio: false,
+          ),
+          IOSUiSettings(
+            title: 'Crop Nutrition Table',
+          ),
+        ],
+      );
+      if (cropped == null) {
+        setState(() => _busy = false);
+        return;
+      }
+
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => OcrReviewScreen(
+            imageFile: File(cropped.path),
+            purpose: OcrReviewPurpose.nutrition,
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _skip() async {
+    setState(() => _busy = true);
+    final scan = context.read<ScanProvider>();
+    await scan.analyzeTwoImages(); // no nutrition photo - ingredients only
+    if (!mounted) return;
+    setState(() => _busy = false);
+
+    if (scan.stage == ScanStage.result) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ResultScreen()),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(scan.errorMessage ?? 'Could not analyze the image')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        title: const Text('Scan Nutrition Information'),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 220,
+                height: 220,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.white38, width: 2),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(Icons.receipt_long_rounded, color: Colors.white54, size: 56),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Now scan the nutrition information.\nFit the table within the frame, keep it well lit and in focus.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.camera_alt_rounded),
+                label: const Text('Take Photo'),
+                onPressed: _busy ? null : () => _capture(ImageSource.camera),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.greenPrimary,
+                  minimumSize: const Size(double.infinity, 52),
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.photo_library_outlined, color: Colors.white),
+                label: const Text('Choose from Gallery', style: TextStyle(color: Colors.white)),
+                onPressed: _busy ? null : () => _capture(ImageSource.gallery),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Colors.white38),
+                  minimumSize: const Size(double.infinity, 52),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: _busy ? null : _skip,
+                child: const Text(
+                  'Skip - analyze ingredients only',
+                  style: TextStyle(color: Colors.white70),
+                ),
+              ),
+              if (_busy) const Padding(
+                padding: EdgeInsets.only(top: 20),
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+===== FILE: lib\screens\ocr_camera_screen.dart =====
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:image_cropper/image_cropper.dart';
+import '../core/theme.dart';
+import 'ocr_review_screen.dart';
+
+/// Captures a photo of an ingredients label using the device camera
+/// (or picks one from the gallery) for OCR-based analysis.
+class OcrCameraScreen extends StatefulWidget {
+  const OcrCameraScreen({super.key});
+
+  @override
+  State<OcrCameraScreen> createState() => _OcrCameraScreenState();
+}
+
+class _OcrCameraScreenState extends State<OcrCameraScreen> {
+  final _picker = ImagePicker();
+  bool _busy = false;
+
+  Future<void> _capture(ImageSource source) async {
+    setState(() => _busy = true);
+    try {
+      final file = await _picker.pickImage(source: source, imageQuality: 90);
+      if (file == null) {
+        setState(() => _busy = false);
+        return;
+      }
+
+      // Let the user crop out background clutter before OCR - improves
+      // accuracy and lets them exclude anything that isn't the label.
+      final cropped = await ImageCropper().cropImage(
+        sourcePath: file.path,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Crop Ingredients Label',
+            toolbarColor: AppColors.greenPrimary,
+            toolbarWidgetColor: Colors.white,
+            lockAspectRatio: false,
+          ),
+          IOSUiSettings(
+            title: 'Crop Ingredients Label',
+          ),
+        ],
+      );
+      if (cropped == null) {
+        // User cancelled the crop - stay on this screen.
+        setState(() => _busy = false);
+        return;
+      }
+
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => OcrReviewScreen(imageFile: File(cropped.path))),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        title: const Text('Scan Ingredients Label'),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 220,
+                height: 220,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.white38, width: 2),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(Icons.document_scanner_outlined, color: Colors.white54, size: 56),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Fit the ingredients text within the frame,\nkeep it well lit and in focus.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.camera_alt_rounded),
+                label: const Text('Take Photo'),
+                onPressed: _busy ? null : () => _capture(ImageSource.camera),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.greenPrimary,
+                  minimumSize: const Size(double.infinity, 52),
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.photo_library_outlined, color: Colors.white),
+                label: const Text('Choose from Gallery', style: TextStyle(color: Colors.white)),
+                onPressed: _busy ? null : () => _capture(ImageSource.gallery),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Colors.white38),
+                  minimumSize: const Size(double.infinity, 52),
+                ),
+              ),
+              if (_busy) const Padding(
+                padding: EdgeInsets.only(top: 20),
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\ocr_review_screen.dart =====
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/scan_provider.dart';
+import 'result_screen.dart';
+import 'nutrition_photo_prompt_screen.dart';
+
+/// What this review step is for - determines what happens when the user
+/// taps "Analyze" / "Use Photo".
+enum OcrReviewPurpose { ingredients, nutrition }
+
+class OcrReviewScreen extends StatefulWidget {
+  final File imageFile;
+  final OcrReviewPurpose purpose;
+
+  const OcrReviewScreen({
+    super.key,
+    required this.imageFile,
+    this.purpose = OcrReviewPurpose.ingredients,
+  });
+
+  @override
+  State<OcrReviewScreen> createState() => _OcrReviewScreenState();
+}
+
+class _OcrReviewScreenState extends State<OcrReviewScreen> {
+  bool _analyzing = false;
+
+  Future<void> _confirm() async {
+    final scan = context.read<ScanProvider>();
+    final bytes = await widget.imageFile.readAsBytes();
+
+    if (widget.purpose == OcrReviewPurpose.ingredients) {
+      // Step 1 of 2: store the ingredients photo, then prompt for the
+      // nutrition table photo - no backend call yet.
+      scan.submitIngredientsPhoto(bytes);
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const NutritionPhotoPromptScreen()),
+      );
+      return;
+    }
+
+    // Step 2 of 2: nutrition photo reviewed - send both photos together.
+    setState(() => _analyzing = true);
+    await scan.analyzeTwoImages(nutritionImageBytes: bytes);
+    if (!mounted) return;
+    setState(() => _analyzing = false);
+
+    if (scan.stage == ScanStage.result) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ResultScreen()),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(scan.errorMessage ?? 'Could not analyze the image')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isIngredients = widget.purpose == OcrReviewPurpose.ingredients;
+    return Scaffold(
+      appBar: AppBar(title: Text(isIngredients ? 'Review Photo' : 'Review Nutrition Photo')),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _analyzing ? null : () => Navigator.of(context).pop(),
+                  child: const Text('Retake'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                flex: 2,
+                child: ElevatedButton(
+                  onPressed: _analyzing ? null : _confirm,
+                  child: _analyzing
+                      ? const SizedBox(
+                          height: 20, width: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : Text(isIngredients ? 'Use This Photo' : 'Analyze'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(kCardRadius),
+                child: Image.file(widget.imageFile, fit: BoxFit.cover, width: double.infinity),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              isIngredients
+                  ? 'Make sure the ingredients text is clear and readable before continuing.'
+                  : 'Make sure the nutrition table is clear and readable before analyzing.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.muted, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+===== FILE: lib\screens\product_detail_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/scan_provider.dart';
+import 'analyzing_screen.dart';
+import 'ocr_camera_screen.dart';
+
+class ProductDetailScreen extends StatelessWidget {
+  const ProductDetailScreen({super.key});
+
+  /// Splits a raw ingredients string into individual ingredient lines.
+  /// Splits on top-level commas/semicolons only - text inside
+  /// parentheses or brackets (e.g. "Vegetable oil (palm, sunflower)")
+  /// is kept together as part of that ingredient's description.
+  static List<String> _splitIngredients(String rawText) {
+    // European ingredient lists often use a comma as a DECIMAL POINT
+    // (e.g. "Cacao maigre 7,4%"). Protect digit-comma-digit patterns
+    // before splitting so "7,4" isn't mistaken for a list separator.
+    final text = rawText.replaceAllMapped(
+      RegExp(r'(\d),(\d)'),
+      (m) => '${m.group(1)}\u0001${m.group(2)}',
+    );
+
+    final List<String> result = [];
+    int depth = 0;
+    final buffer = StringBuffer();
+
+    for (final rune in text.runes) {
+      final char = String.fromCharCode(rune);
+      if (char == '(' || char == '[') {
+        depth++;
+        buffer.write(char);
+      } else if (char == ')' || char == ']') {
+        depth--;
+        buffer.write(char);
+      } else if ((char == ',' || char == ';') && depth <= 0) {
+        final piece = buffer.toString().trim();
+        if (piece.isNotEmpty) result.add(piece);
+        buffer.clear();
+      } else {
+        buffer.write(char);
+      }
+    }
+    final last = buffer.toString().trim();
+    if (last.isNotEmpty) result.add(last);
+
+    // Restore protected decimal commas and capitalize each line.
+    return result.map((e) {
+      final restored = e.replaceAll('\u0001', ',');
+      if (restored.isEmpty) return restored;
+      return restored[0].toUpperCase() + restored.substring(1);
+    }).toList();
+  }
+
+  /// True when every nutrition value is effectively zero/blank - a strong
+  /// signal that Open Food Facts had no real nutrition data for this
+  /// product, rather than the product genuinely having all-zero values.
+  static bool _isNutritionEmpty(dynamic nutrition) {
+    for (final entry in nutrition.entries) {
+      final digits = RegExp(r'[\d.]+').firstMatch(entry.value.toString());
+      final value = digits != null ? double.tryParse(digits.group(0)!) ?? 0 : 0;
+      if (value > 0) return false;
+    }
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scan = context.watch<ScanProvider>();
+    final product = scan.product!;
+    final ingredientLines = _splitIngredients(product.ingredients);
+    final missingData = ingredientLines.isEmpty || _isNutritionEmpty(product.nutrition);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Product Details')),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: ElevatedButton.icon(
+            icon: const Icon(Icons.insights_rounded),
+            label: const Text('Analyze Suitability'),
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const AnalyzingScreen()),
+              );
+            },
+          ),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          Center(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: product.image.isNotEmpty
+                  ? Image.network(product.image, width: 160, height: 160, fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => _imageFallback())
+                  : _imageFallback(),
+            ),
+          ),
+          const SizedBox(height: 20),
+                Text(product.name,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: AppColors.ink)),
+          if (product.brand.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(product.brand,
+                  textAlign: TextAlign.center, style: const TextStyle(color: AppColors.muted)),
+            ),
+          const SizedBox(height: 20),
+          if (missingData)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              margin: const EdgeInsets.only(bottom: 16),
+              decoration: BoxDecoration(
+                color: AppColors.amberLight,
+                borderRadius: BorderRadius.circular(kCardRadius),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.info_outline_rounded, color: AppColors.amber, size: 20),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          "We couldn't find complete ingredient or nutrition details for this product.",
+                          style: TextStyle(color: AppColors.ink, fontWeight: FontWeight.w600, fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'For an accurate result, scan the ingredients label and nutrition table directly.',
+                    style: TextStyle(color: AppColors.muted, fontSize: 12, height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.document_scanner_outlined, size: 18),
+                      label: const Text('Scan Label Instead'),
+                      onPressed: () {
+                        scan.productNameOverride = product.name;
+                        Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => const OcrCameraScreen()),
+                        );
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.greenPrimary,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          _sectionCard(
+            title: 'Ingredients',
+            child: ingredientLines.isEmpty
+                ? const Text(
+                    'No ingredient information available.',
+                    style: TextStyle(color: AppColors.muted, height: 1.5),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (int i = 0; i < ingredientLines.length; i++)
+                        Padding(
+                          padding: EdgeInsets.only(bottom: i == ingredientLines.length - 1 ? 0 : 10),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Padding(
+                                padding: EdgeInsets.only(top: 6),
+                                child: Icon(Icons.circle, size: 6, color: AppColors.greenPrimary),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  ingredientLines[i],
+                                  style: const TextStyle(
+                                    color: AppColors.ink,
+                                    height: 1.4,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+          const SizedBox(height: 16),
+          _sectionCard(
+            title: 'Nutrition (per 100g/100ml)',
+            child: Column(
+              children: product.nutrition.entries
+                  .map((e) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(e.key, style: const TextStyle(color: AppColors.muted)),
+                            Text(e.value, style: const TextStyle(fontWeight: FontWeight.w600, color: AppColors.ink)),
+                          ],
+                        ),
+                      ))
+                  .toList(),
+            ),
+          ),
+          const SizedBox(height: 90),
+        ],
+      ),
+    );
+  }
+
+  Widget _imageFallback() => Container(
+        width: 160,
+        height: 160,
+        color: AppColors.greenLight,
+        child: const Icon(Icons.fastfood_rounded, color: AppColors.greenPrimary, size: 48),
+      );
+
+  Widget _sectionCard({required String title, required Widget child}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.ink)),
+          const SizedBox(height: 12),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+===== FILE: lib\screens\profile_view_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/auth_provider.dart';
+import 'auth/login_screen.dart';
+
+class ProfileViewScreen extends StatelessWidget {
+  final bool embedded;
+  const ProfileViewScreen({super.key, this.embedded = false});
+
+  Future<void> _editName(BuildContext context, String current) async {
+    final ctrl = TextEditingController(text: current);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Edit name'),
+        content: TextField(controller: ctrl, decoration: const InputDecoration(labelText: 'Full name')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(context, ctrl.text.trim()), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (result != null && result.isNotEmpty && context.mounted) {
+      await context.read<AuthProvider>().updateProfile(name: result);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    final profile = auth.profile;
+
+    final body = ListView(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+      children: [
+        Center(
+          child: Column(
+            children: [
+              Container(
+                width: 88,
+                height: 88,
+                decoration: const BoxDecoration(color: AppColors.greenLight, shape: BoxShape.circle),
+                child: const Icon(Icons.person_rounded, color: AppColors.greenPrimary, size: 40),
+              ),
+              const SizedBox(height: 14),
+              Text(profile?.name ?? '', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: AppColors.ink)),
+              const SizedBox(height: 4),
+              Text(profile?.email ?? '', style: const TextStyle(color: AppColors.muted)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 28),
+        _tile(
+          icon: Icons.cake_outlined,
+          title: 'Age',
+          value: '${profile?.age ?? "-"} (${profile?.ageGroup ?? ""})',
+        ),
+        _tile(icon: Icons.edit_outlined, title: 'Edit name', value: '', onTap: () => _editName(context, profile?.name ?? '')),
+        const SizedBox(height: 20),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.logout_rounded, color: AppColors.red),
+          label: const Text('Sign out', style: TextStyle(color: AppColors.red)),
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size(double.infinity, 50),
+            side: const BorderSide(color: AppColors.redLight),
+          ),
+          onPressed: () async {
+            await context.read<AuthProvider>().logout();
+            if (context.mounted) {
+              Navigator.of(context).pushAndRemoveUntil(
+                MaterialPageRoute(builder: (_) => const LoginScreen()),
+                (route) => false,
+              );
+            }
+          },
+        ),
+      ],
+    );
+
+    if (embedded) return body;
+    return Scaffold(appBar: AppBar(title: const Text('Profile')), body: body);
+  }
+
+  Widget _tile({required IconData icon, required String title, required String value, VoidCallback? onTap}) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: ListTile(
+        leading: Icon(icon, color: AppColors.greenPrimary),
+        title: Text(title, style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w600)),
+        trailing: value.isNotEmpty
+            ? Text(value, style: const TextStyle(color: AppColors.muted))
+            : const Icon(Icons.chevron_right_rounded, color: AppColors.muted),
+        onTap: onTap,
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\screens\result_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../models/analysis_result.dart';
+import '../models/history_item.dart';
+import '../providers/scan_provider.dart';
+import 'home_screen.dart';
+
+
+/// Splits raw OCR ingredients text into individual items for bullet
+/// display. Splits on commas, but keeps bracketed/parenthetical groups
+/// together - e.g. "RAISING AGENTS [INS 503(ii), INS 500(ii)]" stays one
+/// item instead of being split into three.
+List<String> _splitIngredientItems(String text) {
+  final items = <String>[];
+  final buffer = StringBuffer();
+  var depth = 0;
+
+  for (final char in text.split('')) {
+    if (char == '(' || char == '[') {
+      depth++;
+      buffer.write(char);
+    } else if (char == ')' || char == ']') {
+      depth = depth > 0 ? depth - 1 : 0;
+      buffer.write(char);
+    } else if (char == ',' && depth == 0) {
+      final item = buffer.toString().trim();
+      if (item.isNotEmpty) items.add(item);
+      buffer.clear();
+    } else {
+      buffer.write(char);
+    }
+  }
+  final last = buffer.toString().trim();
+  if (last.isNotEmpty) items.add(last);
+
+  return items;
+}
+
+class ResultScreen extends StatelessWidget {
+  const ResultScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final scan = context.watch<ScanProvider>();
+    final result = scan.result!;
+    final productName = scan.product?.name ?? 'Scanned Label';
+    final image = scan.product?.image ?? '';
+
+    return _ResultView(
+      result: result,
+      productName: productName,
+      image: image,
+      ingredientsText: scan.ocrIngredientsText ?? scan.product?.ingredients,
+      onDone: () {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+          (route) => false,
+        );
+      },
+    );
+  }
+}
+
+/// Read-only result view rendered from a saved history item. Older history
+/// entries saved before the health-condition feature existed simply have
+/// no health_conditions data, so this resolves to an empty list - no crash.
+class ResultScreenFromHistory extends StatelessWidget {
+  final HistoryItem item;
+  const ResultScreenFromHistory({super.key, required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    final result = AnalysisResult(
+      overall: item.overall,
+      ageGroups: item.ageGroups,
+      flags: item.flags,
+      nutritionConcerns: const [],
+      healthConditions: item.healthConditions,
+    );
+    return _ResultView(
+      result: result,
+      productName: item.productName,
+      image: item.image,
+      ingredientsText: null,
+      onDone: () => Navigator.of(context).pop(),
+    );
+  }
+}
+
+class _ResultView extends StatelessWidget {
+  final AnalysisResult result;
+  final String productName;
+  final String image;
+  final String? ingredientsText;
+  final VoidCallback onDone;
+
+  const _ResultView({
+    required this.result,
+    required this.productName,
+    required this.image,
+    required this.ingredientsText,
+    required this.onDone,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final style = StatusStyle.forStatus(result.overall);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Analysis Result')),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: ElevatedButton(onPressed: onDone, child: const Text('Done')),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: style.bg,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              children: [
+                Icon(
+                  result.overall == 'Avoid'
+                      ? Icons.dangerous_rounded
+                      : result.overall == 'Use Caution'
+                          ? Icons.warning_amber_rounded
+                          : Icons.check_circle_rounded,
+                  color: style.fg,
+                  size: 40,
+                ),
+                const SizedBox(height: 10),
+                Text(result.overall,
+                    style: TextStyle(color: style.fg, fontWeight: FontWeight.w700, fontSize: 20)),
+                const SizedBox(height: 4),
+                Text(productName,
+                    textAlign: TextAlign.center, style: const TextStyle(color: AppColors.muted)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Text('By age group', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+          const SizedBox(height: 12),
+          ...result.ageGroups.map(_ageGroupCard),
+
+          // --- NEW: Health Conditions section - only rendered if non-empty ---
+          if (result.healthConditions.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text('Health Conditions', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+            const SizedBox(height: 4),
+            const Text(
+              'General product information - not a personal diagnosis.',
+              style: TextStyle(color: AppColors.muted, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            ...result.healthConditions.map(_healthConditionCard),
+          ],
+
+          if (result.flags.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text('Ingredient flags', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+            const SizedBox(height: 12),
+            ...result.flags.map((f) => _flagTile(f.ingredient, f.concern)),
+          ],
+          if (result.nutritionConcerns.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text('Nutrition concerns', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+            const SizedBox(height: 12),
+            ...result.nutritionConcerns.map((n) => _flagTile('${n.label}: ${n.value}', n.concern)),
+          ],
+          if (ingredientsText != null && ingredientsText!.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text('Ingredients read', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.ink)),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: AppColors.surface,
+                borderRadius: BorderRadius.circular(kCardRadius),
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: _splitIngredientItems(ingredientsText!).map((item) {
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('â€¢  ', style: TextStyle(color: AppColors.ink, height: 1.5)),
+                        Expanded(
+                          child: Text(item, style: const TextStyle(color: AppColors.ink, height: 1.5)),
+                        ),
+                      ],
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ],
+          const SizedBox(height: 90),
+        ],
+      ),
+    );
+  }
+
+  Widget _ageGroupCard(dynamic ageGroup) {
+    final style = StatusStyle.forStatus(ageGroup.status);
+    IconData icon;
+    switch (ageGroup.group) {
+      case 'Child':
+        icon = Icons.child_care_rounded;
+        break;
+      case 'Teenager':
+        icon = Icons.face_retouching_natural_rounded;
+        break;
+      default:
+        icon = Icons.person_rounded;
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(color: style.bg, borderRadius: BorderRadius.circular(10)),
+            child: Icon(icon, color: style.fg, size: 20),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(ageGroup.group, style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.ink)),
+                    Text(ageGroup.status,
+                        style: TextStyle(color: style.fg, fontWeight: FontWeight.w600, fontSize: 12)),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(ageGroup.reason, style: const TextStyle(color: AppColors.muted, fontSize: 13, height: 1.4)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// NEW - card for a single health-condition warning. Same visual
+  /// language as the age-group cards, using a heart icon to distinguish
+  /// "condition" warnings from "age" warnings at a glance.
+  Widget _healthConditionCard(HealthConditionWarning w) {
+    final style = StatusStyle.forStatus(w.severity);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(color: style.bg, borderRadius: BorderRadius.circular(10)),
+            child: Icon(Icons.monitor_heart_rounded, color: style.fg, size: 20),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(w.conditionName,
+                          style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.ink)),
+                    ),
+                    Text(w.severity,
+                        style: TextStyle(color: style.fg, fontWeight: FontWeight.w600, fontSize: 12)),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                if (w.reason.isNotEmpty)
+                  Text(w.reason, style: const TextStyle(color: AppColors.muted, fontSize: 13, height: 1.4)),
+                if (w.recommendation.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Text(w.recommendation,
+                      style: const TextStyle(color: AppColors.ink, fontSize: 13, height: 1.4, fontStyle: FontStyle.italic)),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _flagTile(String title, String subtitle) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.amberLight,
+        borderRadius: BorderRadius.circular(kCardRadius),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.info_outline_rounded, color: AppColors.amber, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.ink, fontSize: 13)),
+                const SizedBox(height: 2),
+                Text(subtitle, style: const TextStyle(color: AppColors.muted, fontSize: 12, height: 1.4)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+===== FILE: lib\screens\scan_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/scan_provider.dart';
+import 'product_detail_screen.dart';
+import 'not_found_screen.dart';
+import 'ocr_camera_screen.dart';
+
+/// Live camera barcode scanner PLUS a manual barcode entry field.
+/// Both paths funnel through the same ScanProvider.lookupBarcode call,
+/// so the backend/API logic is fully reused.
+class ScanScreen extends StatefulWidget {
+  final String initialCategory;
+  const ScanScreen({super.key, this.initialCategory = 'food'});
+
+  @override
+  State<ScanScreen> createState() => _ScanScreenState();
+}
+
+class _ScanScreenState extends State<ScanScreen> {
+  final MobileScannerController _controller = MobileScannerController(
+    detectionSpeed: DetectionSpeed.noDuplicates,
+    formats: const [BarcodeFormat.ean13, BarcodeFormat.ean8, BarcodeFormat.upcA, BarcodeFormat.upcE],
+  );
+  final TextEditingController _manualBarcodeController = TextEditingController();
+  final FocusNode _manualBarcodeFocus = FocusNode();
+
+  bool _handling = false;
+  bool _torchOn = false;
+  String? _manualError;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<ScanProvider>().setCategory(widget.initialCategory);
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _manualBarcodeController.dispose();
+    _manualBarcodeFocus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_handling) return;
+    final barcode = capture.barcodes.firstOrNull?.rawValue;
+    if (barcode == null || barcode.isEmpty) return;
+    await _controller.stop();
+    await _handleBarcode(barcode);
+    if (!mounted) return;
+    await _controller.start();
+  }
+
+  Future<void> _handleManualSubmit() async {
+    final value = _manualBarcodeController.text.trim();
+    if (value.isEmpty) {
+      setState(() => _manualError = 'Enter a barcode number');
+      return;
+    }
+    if (!RegExp(r'^\d{6,14}$').hasMatch(value)) {
+      setState(() => _manualError = 'Enter a valid numeric barcode');
+      return;
+    }
+    setState(() => _manualError = null);
+    _manualBarcodeFocus.unfocus();
+    await _controller.stop();
+    await _handleBarcode(value);
+    if (!mounted) return;
+    await _controller.start();
+  }
+
+  /// Shared resolution path for both camera-detected and manually-entered
+  /// barcodes. Uses the existing ScanProvider -> ProductService -> backend
+  /// barcode-analysis API - nothing about that flow changes.
+  Future<void> _handleBarcode(String barcode) async {
+    if (_handling) return;
+    setState(() => _handling = true);
+
+    final scan = context.read<ScanProvider>();
+    await scan.lookupBarcode(barcode);
+
+    if (!mounted) {
+      setState(() => _handling = false);
+      return;
+    }
+
+    if (scan.stage == ScanStage.notFound) {
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => NotFoundScreen(barcode: barcode)),
+      );
+    } else if (scan.product != null) {
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const ProductDetailScreen()),
+      );
+    } else if (scan.stage == ScanStage.error) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(scan.errorMessage ?? 'Something went wrong')),
+      );
+    }
+
+    if (!mounted) return;
+    setState(() => _handling = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Camera preview section
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  MobileScanner(controller: _controller, onDetect: _onDetect),
+                  Container(color: Colors.black.withValues(alpha: 0.30)),
+                  _buildScanFrame(),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _circleButton(Icons.close_rounded, () => Navigator.of(context).pop()),
+                        const Text(
+                          'Scan Barcode',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                        ),
+                        _circleButton(
+                          _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                          () {
+                            _controller.toggleTorch();
+                            setState(() => _torchOn = !_torchOn);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 16,
+                    child: Column(
+                      children: [
+                        const Text(
+                          'Align the barcode within the frame',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                        const SizedBox(height: 12),
+                        TextButton.icon(
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute(builder: (_) => const OcrCameraScreen()),
+                          ),
+                          icon: const Icon(Icons.document_scanner_outlined, color: Colors.white),
+                          label: const Text('No barcode? Scan ingredients label',
+                              style: TextStyle(color: Colors.white)),
+                          style: TextButton.styleFrom(
+                            backgroundColor: Colors.white24,
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_handling)
+                    Container(
+                      color: Colors.black54,
+                      alignment: Alignment.center,
+                      child: const CircularProgressIndicator(color: Colors.white),
+                    ),
+                ],
+              ),
+            ),
+
+            // Manual barcode entry section (always visible below the camera)
+            Container(
+              color: AppColors.surface,
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Or enter barcode manually',
+                    style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.ink, fontSize: 14),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _manualBarcodeController,
+                          focusNode: _manualBarcodeFocus,
+                          keyboardType: TextInputType.number,
+                          textInputAction: TextInputAction.search,
+                          enabled: !_handling,
+                          onSubmitted: (_) => _handleManualSubmit(),
+                          decoration: InputDecoration(
+                            hintText: 'e.g. 8901030895555',
+                            errorText: _manualError,
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        height: 48,
+                        child: ElevatedButton(
+                          onPressed: _handling ? null : _handleManualSubmit,
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 18),
+                          ),
+                          child: _handling
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                                )
+                              : const Text('Search'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScanFrame() {
+    return Center(
+      child: Container(
+        width: 260,
+        height: 160,
+        decoration: BoxDecoration(
+          border: Border.all(color: AppColors.greenMid, width: 2.5),
+          borderRadius: BorderRadius.circular(20),
+        ),
+      ),
+    );
+  }
+
+  Widget _circleButton(IconData icon, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(20),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: const BoxDecoration(color: Colors.black38, shape: BoxShape.circle),
+        child: Icon(icon, color: Colors.white, size: 20),
+      ),
+    );
+  }
+}
+
+extension _FirstOrNull<T> on List<T> {
+  T? get firstOrNull => isEmpty ? null : first;
+}
+
+===== FILE: lib\screens\splash_screen.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../core/theme.dart';
+import '../providers/auth_provider.dart';
+import 'auth/login_screen.dart';
+import 'home_screen.dart';
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> {
+  @override
+  void initState() {
+    super.initState();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    final auth = context.read<AuthProvider>();
+    await auth.bootstrap();
+    await Future.delayed(const Duration(milliseconds: 600));
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => auth.status == AuthStatus.authenticated
+            ? const HomeScreen()
+            : const LoginScreen(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.greenPrimary,
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 88,
+              height: 88,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: const Icon(Icons.eco_rounded, color: AppColors.greenPrimary, size: 48),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              'NutriCheck',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 28,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Know what you eat',
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(height: 32),
+            const SizedBox(
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\services\analysis_service.dart =====
+import 'dart:typed_data';
+import '../core/api_client.dart';
+import '../models/analysis_result.dart';
+import '../models/product.dart';
+
+class OcrAnalysisOutcome {
+  final AnalysisResult result;
+  final String ingredientsText;
+  OcrAnalysisOutcome({required this.result, required this.ingredientsText});
+}
+
+class AnalysisService {
+  final _api = ApiClient.instance;
+
+  Future<AnalysisResult> analyzeProduct(Product product, {String category = 'food'}) async {
+    final data = await _api.post('/analyze/product', body: {
+      'name': product.name,
+      'brand': product.brand,
+      'image': product.image,
+      'barcode': product.barcode,
+      'ingredients': product.ingredients,
+      'nutrition': product.nutrition.toJson(),
+      'category': category,
+    });
+    return AnalysisResult.fromJson(data['result']);
+  }
+  Future<OcrAnalysisOutcome> analyzeImage(
+    Uint8List imageBytes, {
+    String filename = 'label.jpg',
+    String category = 'food',
+    String productName = 'Scanned Label',
+  }) async {
+    final data = await _api.postMultipart(
+      '/analyze/ocr',
+      fileBytes: imageBytes,
+      filename: filename,
+      fields: {'category': category, 'name': productName},
+    );
+    return OcrAnalysisOutcome(
+      result: AnalysisResult.fromJson(data['result']),
+      ingredientsText: data['ingredients_text'] ?? '',
+    );
+  }
+
+  /// Two-photo OCR flow: ingredients label + nutrition table.
+  /// [nutritionImageBytes] is optional - if null, analysis proceeds with
+  /// ingredients only (matches the backend's optional nutrition_image).
+  Future<TwoPhotoOcrOutcome> analyzeTwoImages(
+    Uint8List ingredientsImageBytes, {
+    Uint8List? nutritionImageBytes,
+    String category = 'food',
+    String productName = 'Scanned Label',
+  }) async {
+    final files = {
+      'ingredients_image': (bytes: ingredientsImageBytes, filename: 'ingredients.jpg'),
+      if (nutritionImageBytes != null)
+        'nutrition_image': (bytes: nutritionImageBytes, filename: 'nutrition.jpg'),
+    };
+    final data = await _api.postMultipartFiles(
+      '/analyze/ocr-full',
+      files: files,
+      fields: {'category': category, 'name': productName},
+    );
+    return TwoPhotoOcrOutcome(
+      result: AnalysisResult.fromJson(data['result']),
+      ingredientsText: data['ingredients_text'] ?? '',
+    );
+  }
+}
+
+class TwoPhotoOcrOutcome {
+  final AnalysisResult result;
+  final String ingredientsText;
+  TwoPhotoOcrOutcome({required this.result, required this.ingredientsText});
+}
+
+===== FILE: lib\services\auth_service.dart =====
+import '../core/api_client.dart';
+import '../models/user_profile.dart';
+
+class AuthService {
+  final _api = ApiClient.instance;
+
+  Future<UserProfile> register({
+    required String name,
+    required String email,
+    required String password,
+    required int age,
+  }) async {
+    final data = await _api.post(
+      '/auth/register',
+      body: {'name': name, 'email': email, 'password': password, 'age': age},
+      auth: false,
+    );
+    await _api.saveTokens(access: data['access_token'], refresh: data['refresh_token']);
+    return UserProfile.fromJson(data['user']);
+  }
+
+  Future<UserProfile> login({required String email, required String password}) async {
+    final data = await _api.post(
+      '/auth/login',
+      body: {'email': email, 'password': password},
+      auth: false,
+    );
+    await _api.saveTokens(access: data['access_token'], refresh: data['refresh_token']);
+    return UserProfile.fromJson(data['user']);
+  }
+
+  Future<UserProfile> fetchMe() async {
+    final data = await _api.get('/auth/me');
+    return UserProfile.fromJson(data['user']);
+  }
+
+  Future<UserProfile> updateProfile({String? name, int? age}) async {
+    final body = <String, dynamic>{};
+    if (name != null) body['name'] = name;
+    if (age != null) body['age'] = age;
+    final data = await _api.put('/auth/me', body: body);
+    return UserProfile.fromJson(data['user']);
+  }
+
+  Future<void> logout() async {
+    await _api.clearTokens();
+  }
+
+  Future<bool> get isLoggedIn => _api.isLoggedIn;
+}
+
+
+===== FILE: lib\services\history_service.dart =====
+import '../core/api_client.dart';
+import '../models/history_item.dart';
+
+class HistoryService {
+  final _api = ApiClient.instance;
+
+  Future<List<HistoryItem>> list({int page = 1, int perPage = 20}) async {
+    final data = await _api.get('/history', query: {'page': page, 'per_page': perPage});
+    return (data['items'] as List).map((e) => HistoryItem.fromJson(e)).toList();
+  }
+
+  Future<void> delete(String id) => _api.delete('/history/$id');
+
+  Future<void> clearAll() => _api.delete('/history');
+}
+
+
+===== FILE: lib\services\product_service.dart =====
+import '../core/api_client.dart';
+import '../models/product.dart';
+
+class ProductNotFoundException implements Exception {
+  final String barcode;
+  ProductNotFoundException(this.barcode);
+}
+
+class ProductService {
+  final _api = ApiClient.instance;
+
+  Future<Product> lookupBarcode(String barcode) async {
+    try {
+      final data = await _api.get('/products/barcode/$barcode');
+      return Product.fromJson(data['product']);
+    } on ApiException catch (e) {
+      if (e.statusCode == 404) throw ProductNotFoundException(barcode);
+      rethrow;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> search(String query) async {
+    final data = await _api.get('/products/search', query: {'q': query});
+    return List<Map<String, dynamic>>.from(data['results'] ?? []);
+  }
+}
+
+
+===== FILE: lib\widgets\bottom_nav.dart =====
+import 'package:flutter/material.dart';
+import '../core/theme.dart';
+
+class AppBottomNav extends StatelessWidget {
+  final int currentIndex;
+  final ValueChanged<int> onChanged;
+
+  const AppBottomNav({super.key, required this.currentIndex, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final items = const [
+      (icon: Icons.home_rounded, label: 'Home'),
+      (icon: Icons.qr_code_scanner_rounded, label: 'Scan'),
+      (icon: Icons.history_rounded, label: 'History'),
+      (icon: Icons.person_rounded, label: 'Profile'),
+    ];
+
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceAround,
+          children: List.generate(items.length, (i) {
+            final active = i == currentIndex;
+            final item = items[i];
+            return InkWell(
+              onTap: () => onChanged(i),
+              borderRadius: BorderRadius.circular(12),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      item.icon,
+                      color: active ? AppColors.greenPrimary : AppColors.muted,
+                      size: 24,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      item.label,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: active ? AppColors.greenPrimary : AppColors.muted,
+                        fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\widgets\category_card.dart =====
+import 'package:flutter/material.dart';
+import '../core/theme.dart';
+
+class CategoryCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  const CategoryCard({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(kCardRadius),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(kCardRadius),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: AppColors.greenLight,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: AppColors.greenPrimary),
+            ),
+            const SizedBox(height: 12),
+            Text(title,
+                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15, color: AppColors.ink)),
+            const SizedBox(height: 4),
+            Text(subtitle, style: const TextStyle(fontSize: 12, color: AppColors.muted)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\widgets\history_card.dart =====
+import 'package:flutter/material.dart';
+import '../core/theme.dart';
+import '../models/history_item.dart';
+import 'status_badge.dart';
+
+class HistoryCard extends StatelessWidget {
+  final HistoryItem item;
+  final VoidCallback? onTap;
+  final VoidCallback? onDismiss;
+
+  const HistoryCard({super.key, required this.item, this.onTap, this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    final card = Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCardRadius),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: item.image.isNotEmpty
+                ? Image.network(item.image, width: 52, height: 52, fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => _fallbackThumb())
+                : _fallbackThumb(),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(item.productName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600, color: AppColors.ink)),
+                if (item.brand.isNotEmpty)
+                  Text(item.brand,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12, color: AppColors.muted)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          StatusBadge(status: item.overall, fontSize: 11),
+        ],
+      ),
+    );
+
+    final tappable = InkWell(borderRadius: BorderRadius.circular(kCardRadius), onTap: onTap, child: card);
+
+    if (onDismiss == null) return tappable;
+
+    return Dismissible(
+      key: ValueKey(item.id),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        decoration: BoxDecoration(color: AppColors.redLight, borderRadius: BorderRadius.circular(kCardRadius)),
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 20),
+        child: const Icon(Icons.delete_outline, color: AppColors.red),
+      ),
+      onDismissed: (_) => onDismiss!(),
+      child: tappable,
+    );
+  }
+
+  Widget _fallbackThumb() => Container(
+        width: 52,
+        height: 52,
+        color: AppColors.greenLight,
+        child: const Icon(Icons.fastfood_rounded, color: AppColors.greenPrimary, size: 22),
+      );
+}
+
+
+===== FILE: lib\widgets\status_badge.dart =====
+import 'package:flutter/material.dart';
+import '../core/theme.dart';
+
+class StatusBadge extends StatelessWidget {
+  final String status;
+  final double fontSize;
+  const StatusBadge({super.key, required this.status, this.fontSize = 12});
+
+  @override
+  Widget build(BuildContext context) {
+    final style = StatusStyle.forStatus(status);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: style.bg,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        status,
+        style: TextStyle(
+          color: style.fg,
+          fontWeight: FontWeight.w600,
+          fontSize: fontSize,
+        ),
+      ),
+    );
+  }
+}
+
+
+===== FILE: lib\main.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'core/theme.dart';
+import 'providers/auth_provider.dart';
+import 'providers/scan_provider.dart';
+import 'providers/history_provider.dart';
+import 'screens/splash_screen.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const NutriCheckApp());
+}
+
+class NutriCheckApp extends StatelessWidget {
+  const NutriCheckApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => AuthProvider()),
+        ChangeNotifierProvider(create: (_) => ScanProvider()),
+        ChangeNotifierProvider(create: (_) => HistoryProvider()),
+      ],
+      child: MaterialApp(
+        title: 'NutriCheck',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.light,
+        home: const SplashScreen(),
+      ),
+    );
+  }
+}
+
+
+===== FILE: test\widget_test.dart =====
+// This is a basic Flutter widget test.
+//
+// To perform an interaction with a widget in your test, use the WidgetTester
+// utility in the flutter_test package. For example, you can send tap and scroll
+// gestures. You can also use WidgetTester to find child widgets in the widget
+// tree, read text, and verify that the values of widget properties are correct.
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:nutricheck/main.dart';
+
+void main() {
+  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
+    // Build our app and trigger a frame.
+    await tester.pumpWidget(const MyApp());
+
+    // Verify that our counter starts at 0.
+    expect(find.text('0'), findsOneWidget);
+    expect(find.text('1'), findsNothing);
+
+    // Tap the '+' icon and trigger a frame.
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pump();
+
+    // Verify that our counter has incremented.
+    expect(find.text('0'), findsNothing);
+    expect(find.text('1'), findsOneWidget);
+  });
+}
+
+
+===== FILE: analysis_options.yaml =====
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_single_quotes: true
+
+
+===== FILE: pubspec.yaml =====
+name: nutricheck
+description: "NutriCheck - scan barcodes or ingredient labels and get instant age-based nutrition guidance."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # State management
+  provider: ^6.1.2
+
+  # Networking
+  http: ^1.2.2
+
+  # Barcode scanning (real camera-based scanner)
+  mobile_scanner: ^5.2.3
+
+  # Camera for OCR ingredient-label capture
+  camera: ^0.11.0+2
+
+  # Local persistence (auth token, cached profile)
+  shared_preferences: ^2.3.2
+  flutter_secure_storage: ^9.2.2
+
+  # UI helpers
+  google_fonts: ^6.2.1
+  intl: ^0.19.0
+  image_picker: ^1.1.2
+  image_cropper: ^8.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+   
+
+dependency_overrides:
+  path_provider_android: 2.2.14

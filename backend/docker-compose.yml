@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "5000:5000"
+    environment:
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-jwt-secret}
+      MONGODB_URI: mongodb://mongo:27017/nutricheck
+      OFF_API_BASE: https://world.openfoodfacts.org/api/v2
+      CORS_ORIGINS: "*"
+
+volumes:
+  mongo_data:

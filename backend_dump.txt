@@ -1,0 +1,2014 @@
+﻿
+===== FILE: app\models\health.py =====
+"""
+Additive models for the health-condition analysis feature.
+
+Nothing here touches User, Product, or ScanHistory - those collections
+and their fields are untouched. Every collection name below matches
+exactly what was specified: health_conditions, health_condition_warnings,
+ingredients, ingredient_categories, ingredient_aliases,
+ingredient_risk_rules, nutrition_risk_rules, product_ingredients,
+nutrition, analysis_results, analysis_rules, ocr_scans.
+"""
+
+from datetime import datetime
+from mongoengine import (
+    Document, StringField, IntField, FloatField, BooleanField,
+    DateTimeField, ReferenceField, ListField, DictField, NULLIFY, CASCADE
+)
+
+
+# ---------------------------------------------------------------------------
+# Reference / configuration collections
+# ---------------------------------------------------------------------------
+
+class HealthCondition(Document):
+    """Reference categories used for product analysis - NOT a user's
+    personal medical record. e.g. Diabetes, High Blood Pressure."""
+    condition_name = StringField(required=True, unique=True)
+    description = StringField(default="")
+    active = BooleanField(default=True)
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "health_conditions",
+        "indexes": ["condition_name"],
+    }
+
+
+class IngredientCategory(Document):
+    category_name = StringField(required=True, unique=True)
+    description = StringField(default="")
+    active = BooleanField(default=True)
+
+    meta = {"collection": "ingredient_categories"}
+
+
+class Ingredient(Document):
+    ingredient_name = StringField(required=True)
+    normalized_name = StringField(required=True)
+    category = ReferenceField(IngredientCategory, null=True)
+    risk_type = StringField(default="")
+    description = StringField(default="")
+    active = BooleanField(default=True)
+
+    meta = {
+        "collection": "ingredients",
+        "indexes": ["normalized_name"],
+    }
+
+
+class IngredientAlias(Document):
+    ingredient = ReferenceField(Ingredient, required=True, reverse_delete_rule=CASCADE)
+    alias_name = StringField(required=True)
+    normalized_alias = StringField(required=True)
+
+    meta = {
+        "collection": "ingredient_aliases",
+        "indexes": ["normalized_alias"],
+    }
+
+
+class IngredientRiskRule(Document):
+    """condition and age_group may be null when the rule applies broadly
+    (not condition-specific)."""
+    ingredient = ReferenceField(Ingredient, required=True)
+    condition = ReferenceField(HealthCondition, null=True)
+    age_group_name = StringField(null=True)  # "Child" / "Teenager" / "Adult" - kept simple, string not FK
+    severity = StringField(choices=["Safe", "Caution", "Limit", "Avoid"], required=True)
+    recommendation = StringField(default="")
+    reason = StringField(default="")
+    active = BooleanField(default=True)
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "ingredient_risk_rules",
+        "indexes": ["ingredient", "condition"],
+    }
+
+
+class NutritionRiskRule(Document):
+    nutrient_name = StringField(required=True)  # e.g. "sugars", "sodium"
+    minimum_value = FloatField(null=True)
+    maximum_value = FloatField(null=True)
+    severity = StringField(choices=["Safe", "Caution", "Limit", "Avoid"], required=True)
+    applicable_condition = ReferenceField(HealthCondition, null=True)
+    recommendation = StringField(default="")
+    description = StringField(default="")
+    active = BooleanField(default=True)
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "nutrition_risk_rules",
+        "indexes": ["nutrient_name"],
+    }
+
+
+class AnalysisRule(Document):
+    """General-purpose rule slot for future non-health-condition logic.
+    Not required for the health-condition feature to function."""
+    rule_name = StringField(required=True)
+    rule_type = StringField(default="")
+    condition = StringField(default="")
+    threshold = FloatField(null=True)
+    severity = StringField(default="")
+    recommendation = StringField(default="")
+    description = StringField(default="")
+    active = BooleanField(default=True)
+
+    meta = {"collection": "analysis_rules"}
+
+
+# ---------------------------------------------------------------------------
+# Per-scan linkage collections
+# ---------------------------------------------------------------------------
+
+class ProductIngredient(Document):
+    """Optional normalized link between a scanned product's raw ingredient
+    text and the canonical Ingredient entry. Populated best-effort; the
+    health-condition engine also works directly off ingredients_text if
+    this hasn't been populated for a given product."""
+    barcode = StringField(required=True)  # links to Product.barcode (no rename of Product needed)
+    ingredient = ReferenceField(Ingredient, required=True)
+    original_text = StringField(required=True)
+    ingredient_order = IntField(default=0)
+
+    meta = {
+        "collection": "product_ingredients",
+        "indexes": ["barcode", "ingredient"],
+    }
+
+
+class Nutrition(Document):
+    """Optional normalized nutrition record, separate from the DictField
+    already stored on Product/ScanHistory. Additive only - existing
+    nutrition dicts on Product/ScanHistory are untouched and still used
+    by the existing analyzer."""
+    barcode = StringField(required=True)
+    energy_kcal = FloatField(null=True)
+    total_fat = FloatField(null=True)
+    saturated_fat = FloatField(null=True)
+    trans_fat = FloatField(null=True)
+    carbohydrate = FloatField(null=True)
+    sugars = FloatField(null=True)
+    protein = FloatField(null=True)
+    fiber = FloatField(null=True)
+    sodium = FloatField(null=True)
+    salt = FloatField(null=True)
+    serving_size = StringField(default="")
+    unit = StringField(default="g")
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "nutrition",
+        "indexes": ["barcode"],
+    }
+
+
+class AnalysisResult(Document):
+    """1:1 with a ScanHistory entry (referenced by scan_id = ScanHistory.id
+    as a string, so we never need to modify the ScanHistory model)."""
+    scan_id = StringField(required=True, unique=True)
+    overall_result = StringField(required=True)
+    health_score = IntField(null=True)
+    summary = StringField(default="")
+    analyzed_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "analysis_results",
+        "indexes": ["scan_id"],
+    }
+
+
+class HealthConditionWarning(Document):
+    analysis_id = StringField(required=True)  # AnalysisResult.id as string
+    condition = ReferenceField(HealthCondition, required=True)
+    severity = StringField(choices=["Safe", "Caution", "Limit", "Avoid"], required=True)
+    recommendation = StringField(default="")
+    reason = StringField(default="")
+    created_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "health_condition_warnings",
+        "indexes": ["analysis_id", "condition"],
+    }
+
+
+class OcrScan(Document):
+    """OCR-ready collection, unused by the health-condition feature today.
+    product_id is intentionally optional per spec."""
+    user_id = StringField(required=True)
+    product_id = StringField(null=True)
+    scan_type = StringField(choices=["Ingredient List", "Nutrition Table"], required=True)
+    image_path = StringField(default="")
+    extracted_text = StringField(default="")
+    confidence_score = FloatField(null=True)
+    status = StringField(default="pending")
+    created_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {"collection": "ocr_scans"}
+
+===== FILE: app\models\history.py =====
+from datetime import datetime
+from mongoengine import (
+    Document,
+    StringField,
+    DictField,
+    ListField,
+    ReferenceField,
+    DateTimeField,
+    CASCADE,
+)
+from app.models.user import User
+
+
+class ScanHistory(Document):
+    user = ReferenceField(User, required=True, reverse_delete_rule=CASCADE)
+    source = StringField(choices=["barcode", "ocr"], required=True)
+    product_name = StringField(required=True)
+    brand = StringField(default="")
+    image = StringField(default="")
+    barcode = StringField(default="")
+    ingredients_text = StringField(default="")
+    nutrition = DictField(default=dict)
+    overall = StringField(
+        choices=["Generally Suitable", "Use Caution", "Avoid"], required=True
+    )
+    age_groups = ListField(DictField(), default=list)
+    flags = ListField(DictField(), default=list)
+    nutrition_concerns = ListField(DictField(), default=list)
+    created_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {
+        "collection": "scan_history",
+        "indexes": ["user", "-created_at"],
+        "ordering": ["-created_at"],
+    }
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "source": self.source,
+            "product_name": self.product_name,
+            "brand": self.brand,
+            "image": self.image,
+            "barcode": self.barcode,
+            "ingredients": self.ingredients_text,
+            "nutrition": self.nutrition,
+            "overall": self.overall,
+            "age_groups": self.age_groups,
+            "flags": self.flags,
+            "nutrition_concerns": self.nutrition_concerns,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+===== FILE: app\models\product.py =====
+from datetime import datetime
+from mongoengine import (
+    Document,
+    StringField,
+    DictField,
+    DateTimeField,
+)
+
+
+class Product(Document):
+    """
+    Local cache of products resolved from the Open Food Facts database
+    (https://world.openfoodfacts.org). Populated on-demand the first time
+    a barcode is scanned so repeat scans are fast and work offline-ish.
+    No hard-coded/dummy products ship with this app.
+    """
+
+    barcode = StringField(required=True, unique=True)
+    name = StringField(required=True)
+    brand = StringField(default="")
+    category = StringField(default="")
+    image = StringField(default="")
+    ingredients_text = StringField(default="")
+    nutrition = DictField(default=dict)  # energy, fat, saturatedFat, carbs, sugars, fiber, protein, salt
+    source = StringField(default="openfoodfacts")
+    fetched_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {"collection": "products", "indexes": ["barcode"]}
+
+    def to_dict(self):
+        return {
+            "barcode": self.barcode,
+            "name": self.name,
+            "brand": self.brand,
+            "category": self.category,
+            "image": self.image,
+            "ingredients": self.ingredients_text,
+            "nutrition": self.nutrition,
+        }
+
+
+===== FILE: app\models\user.py =====
+import bcrypt
+from datetime import datetime
+from mongoengine import (
+    Document,
+    StringField,
+    EmailField,
+    IntField,
+    DateTimeField,
+)
+
+
+class User(Document):
+    name = StringField(required=True, max_length=100)
+    email = EmailField(required=True, unique=True)
+    password_hash = StringField(required=True)
+    age = IntField(required=True, min_value=1, max_value=120)
+    age_group = StringField(choices=["Child", "Teenager", "Adult"])
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    meta = {"collection": "users", "indexes": ["email"]}
+
+    def set_password(self, raw_password: str):
+        self.password_hash = bcrypt.hashpw(
+            raw_password.encode("utf-8"), bcrypt.gensalt()
+        ).decode("utf-8")
+
+    def check_password(self, raw_password: str) -> bool:
+        return bcrypt.checkpw(
+            raw_password.encode("utf-8"), self.password_hash.encode("utf-8")
+        )
+
+    @staticmethod
+    def compute_age_group(age: int) -> str:
+        if age < 13:
+            return "Child"
+        if age < 18:
+            return "Teenager"
+        return "Adult"
+
+    def to_public_dict(self):
+        return {
+            "id": str(self.id),
+            "name": self.name,
+            "email": self.email,
+            "age": self.age,
+            "age_group": self.age_group,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+===== FILE: app\models\__init__.py =====
+from app.models.user import User
+from app.models.product import Product
+from app.models.history import ScanHistory
+
+__all__ = ["User", "Product", "ScanHistory"]
+
+
+===== FILE: app\routes\analysis.py =====
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from app.models.history import ScanHistory
+from app.models.health import AnalysisResult, HealthConditionWarning, HealthCondition
+from app.services.nutrition_analyzer import analyze
+from app.services.ocr_service import extract_ingredients_from_image, extract_nutrition_from_image
+from app.services.health_condition_engine import evaluate_health_conditions
+
+analysis_bp = Blueprint("analysis", __name__, url_prefix="/api/analyze")
+
+
+def _store_health_conditions(scan_id: str, overall: str, health_conditions: list):
+    """Additive persistence for the health-condition feature. Never
+    raises - if this fails for any reason, the main analysis response
+    still goes back to the client unaffected."""
+    try:
+        existing = AnalysisResult.objects(scan_id=scan_id).first()
+        if existing:
+            analysis_result = existing
+        else:
+            # Simple health score: start at 100, subtract per severity.
+            score = 100
+            for w in health_conditions:
+                score -= 30 if w["severity"] == "Avoid" else 15
+            score = max(0, min(100, score))
+
+            analysis_result = AnalysisResult(
+                scan_id=scan_id,
+                overall_result=overall,
+                health_score=score,
+                summary=f"{len(health_conditions)} health condition warning(s) generated." if health_conditions else "No specific health condition warnings.",
+            ).save()
+
+        for w in health_conditions:
+            condition = HealthCondition.objects(condition_name=w["condition_name"]).first()
+            if not condition:
+                continue
+            already = HealthConditionWarning.objects(
+                analysis_id=str(analysis_result.id), condition=condition
+            ).first()
+            if already:
+                continue
+            HealthConditionWarning(
+                analysis_id=str(analysis_result.id),
+                condition=condition,
+                severity=w["severity"],
+                recommendation=w["recommendation"],
+                reason=w["reason"],
+            ).save()
+    except Exception:
+        # Fail silently - health-condition persistence is additive and
+        # must never break the primary analysis response.
+        pass
+
+
+@analysis_bp.post("/product")
+@jwt_required()
+def analyze_product():
+    """Analyze a product already resolved via barcode lookup and save to history."""
+    data = request.get_json(silent=True) or {}
+    ingredients = data.get("ingredients", "")
+    nutrition = data.get("nutrition", {})
+    category = data.get("category", "food")
+
+    if not ingredients and not nutrition:
+        return jsonify({"error": "ingredients or nutrition data is required."}), 400
+
+    result = analyze(ingredients, nutrition, category)
+
+    history = ScanHistory(
+        user=get_jwt_identity(),
+        source="barcode",
+        product_name=data.get("name", "Unknown Product"),
+        brand=data.get("brand", ""),
+        image=data.get("image", ""),
+        barcode=data.get("barcode", ""),
+        ingredients_text=ingredients,
+        nutrition=nutrition,
+        overall=result["overall"],
+        age_groups=result["age_groups"],
+        flags=result["flags"],
+        nutrition_concerns=result["nutrition_concerns"],
+    )
+    history.save()
+
+    # --- Additive: health-condition warnings (existing fields above unchanged) ---
+    health_conditions = evaluate_health_conditions(ingredients, nutrition)
+    _store_health_conditions(str(history.id), result["overall"], health_conditions)
+    result["health_conditions"] = health_conditions  # always present, [] if none
+
+    return jsonify({"result": result, "history_id": str(history.id)})
+
+
+@analysis_bp.post("/ocr")
+@jwt_required()
+def analyze_ocr():
+    """Accept a photographed label, run OCR, analyze, and save to history."""
+    if "image" not in request.files:
+        return jsonify({"error": "An 'image' file is required."}), 400
+
+    image_file = request.files["image"]
+    image_bytes = image_file.read()
+    if not image_bytes:
+        return jsonify({"error": "Uploaded image is empty."}), 400
+
+    ingredients_text = extract_ingredients_from_image(image_bytes)
+    if not ingredients_text:
+        return jsonify({"error": "Could not read any text from the image. Try a clearer, well-lit photo."}), 422
+
+    category = request.form.get("category", "food")
+    product_name = request.form.get("name", "Scanned Label")
+
+    result = analyze(ingredients_text, {}, category)
+
+    history = ScanHistory(
+        user=get_jwt_identity(),
+        source="ocr",
+        product_name=product_name,
+        ingredients_text=ingredients_text,
+        nutrition={},
+        overall=result["overall"],
+        age_groups=result["age_groups"],
+        flags=result["flags"],
+        nutrition_concerns=result["nutrition_concerns"],
+    )
+    history.save()
+
+    # --- Additive: health-condition warnings ---
+    health_conditions = evaluate_health_conditions(ingredients_text, {})
+    _store_health_conditions(str(history.id), result["overall"], health_conditions)
+    result["health_conditions"] = health_conditions
+
+    return jsonify({
+        "result": result,
+        "ingredients_text": ingredients_text,
+        "history_id": str(history.id),
+    })
+
+
+@analysis_bp.post("/ocr-full")
+@jwt_required()
+def analyze_ocr_full():
+    """Two-photo OCR flow: ingredients label + nutrition table.
+    Used when a product isn't found in Open Food Facts. The nutrition
+    photo is optional - if missing or unreadable, analysis proceeds with
+    ingredients only, same as the existing /ocr route, just with a
+    nutrition dict attached when available."""
+    if "ingredients_image" not in request.files:
+        return jsonify({"error": "An 'ingredients_image' file is required."}), 400
+
+    ingredients_image_bytes = request.files["ingredients_image"].read()
+    if not ingredients_image_bytes:
+        return jsonify({"error": "Uploaded ingredients image is empty."}), 400
+
+    ingredients_text = extract_ingredients_from_image(ingredients_image_bytes)
+    if not ingredients_text:
+        return jsonify({"error": "Could not read any text from the ingredients image. Try a clearer, well-lit photo."}), 422
+
+    nutrition = {}
+    if "nutrition_image" in request.files:
+        nutrition_image_bytes = request.files["nutrition_image"].read()
+        if nutrition_image_bytes:
+            try:
+                nutrition = extract_nutrition_from_image(nutrition_image_bytes)
+            except Exception:
+                # Nutrition OCR is best-effort - never block the whole
+                # analysis if it fails for any reason.
+                nutrition = {}
+
+    category = request.form.get("category", "food")
+    product_name = request.form.get("name", "Scanned Label")
+
+    result = analyze(ingredients_text, nutrition, category)
+
+    history = ScanHistory(
+        user=get_jwt_identity(),
+        source="ocr",
+        product_name=product_name,
+        ingredients_text=ingredients_text,
+        nutrition=nutrition,
+        overall=result["overall"],
+        age_groups=result["age_groups"],
+        flags=result["flags"],
+        nutrition_concerns=result["nutrition_concerns"],
+    )
+    history.save()
+
+    # --- Additive: health-condition warnings (same pattern as /ocr) ---
+    health_conditions = evaluate_health_conditions(ingredients_text, nutrition)
+    _store_health_conditions(str(history.id), result["overall"], health_conditions)
+    result["health_conditions"] = health_conditions
+
+    return jsonify({
+        "result": result,
+        "ingredients_text": ingredients_text,
+        "nutrition": nutrition,
+        "history_id": str(history.id),
+    })
+
+===== FILE: app\routes\auth.py =====
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import (
+    create_access_token,
+    create_refresh_token,
+    jwt_required,
+    get_jwt_identity,
+)
+from mongoengine.errors import NotUniqueError, ValidationError
+from app.models.user import User
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+
+
+@auth_bp.post("/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    age = data.get("age")
+
+    errors = {}
+    if not name:
+        errors["name"] = "Name is required."
+    if not email:
+        errors["email"] = "Email is required."
+    if not password or len(password) < 6:
+        errors["password"] = "Password must be at least 6 characters."
+    try:
+        age = int(age)
+        if age < 1 or age > 120:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors["age"] = "A valid age is required."
+
+    if errors:
+        return jsonify({"errors": errors}), 400
+
+    user = User(name=name, email=email, age=age)
+    user.age_group = User.compute_age_group(age)
+    user.set_password(password)
+
+    try:
+        user.save()
+    except NotUniqueError:
+        return jsonify({"errors": {"email": "An account with this email already exists."}}), 409
+    except ValidationError as exc:
+        return jsonify({"errors": {"validation": str(exc)}}), 400
+
+    access_token = create_access_token(identity=str(user.id))
+    refresh_token = create_refresh_token(identity=str(user.id))
+    return jsonify({
+        "user": user.to_public_dict(),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }), 201
+
+
+@auth_bp.post("/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    user = User.objects(email=email).first()
+    if not user or not user.check_password(password):
+        return jsonify({"error": "Invalid email or password."}), 401
+
+    access_token = create_access_token(identity=str(user.id))
+    refresh_token = create_refresh_token(identity=str(user.id))
+    return jsonify({
+        "user": user.to_public_dict(),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    })
+
+
+@auth_bp.post("/refresh")
+@jwt_required(refresh=True)
+def refresh():
+    identity = get_jwt_identity()
+    new_access_token = create_access_token(identity=identity)
+    return jsonify({"access_token": new_access_token})
+
+
+@auth_bp.get("/me")
+@jwt_required()
+def me():
+    user = User.objects(id=get_jwt_identity()).first()
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+    return jsonify({"user": user.to_public_dict()})
+
+
+@auth_bp.put("/me")
+@jwt_required()
+def update_me():
+    user = User.objects(id=get_jwt_identity()).first()
+    if not user:
+        return jsonify({"error": "User not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    if "name" in data and data["name"].strip():
+        user.name = data["name"].strip()
+    if "age" in data:
+        try:
+            age = int(data["age"])
+            if 1 <= age <= 120:
+                user.age = age
+                user.age_group = User.compute_age_group(age)
+        except (TypeError, ValueError):
+            pass
+    user.save()
+    return jsonify({"user": user.to_public_dict()})
+
+
+===== FILE: app\routes\history.py =====
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from app.models.history import ScanHistory
+from app.models.health import AnalysisResult, HealthConditionWarning
+
+history_bp = Blueprint("history", __name__, url_prefix="/api/history")
+
+
+def _get_health_conditions_for_scan(scan_id: str) -> list:
+    """Additive read-side join: ScanHistory.id -> AnalysisResult.scan_id
+    -> HealthConditionWarning.analysis_id. Mirrors the write side in
+    analysis.py's _store_health_conditions. Never raises - returns []
+    on any lookup failure so history retrieval is unaffected."""
+    try:
+        analysis_result = AnalysisResult.objects(scan_id=scan_id).first()
+        if not analysis_result:
+            return []
+        warnings = HealthConditionWarning.objects(analysis_id=str(analysis_result.id))
+        return [
+            {
+                "condition_name": w.condition.condition_name,
+                "severity": w.severity,
+                "reason": w.reason,
+                "recommendation": w.recommendation,
+            }
+            for w in warnings
+        ]
+    except Exception:
+        return []
+
+
+@history_bp.get("")
+@jwt_required()
+def list_history():
+    page = max(int(request.args.get("page", 1)), 1)
+    per_page = min(int(request.args.get("per_page", 20)), 100)
+    query = ScanHistory.objects(user=get_jwt_identity()).order_by("-created_at")
+    total = query.count()
+    items = query.skip((page - 1) * per_page).limit(per_page)
+    items_data = []
+    for item in items:
+        d = item.to_dict()
+        d["health_conditions"] = _get_health_conditions_for_scan(str(item.id))
+        items_data.append(d)
+    return jsonify({
+        "items": items_data,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    })
+
+
+@history_bp.get("/<history_id>")
+@jwt_required()
+def get_history_item(history_id):
+    item = ScanHistory.objects(id=history_id, user=get_jwt_identity()).first()
+    if not item:
+        return jsonify({"error": "History item not found."}), 404
+    data = item.to_dict()
+    data["health_conditions"] = _get_health_conditions_for_scan(str(item.id))
+    return jsonify({"item": data})
+
+
+@history_bp.delete("/<history_id>")
+@jwt_required()
+def delete_history_item(history_id):
+    item = ScanHistory.objects(id=history_id, user=get_jwt_identity()).first()
+    if not item:
+        return jsonify({"error": "History item not found."}), 404
+    item.delete()
+    return jsonify({"deleted": True})
+
+
+@history_bp.delete("")
+@jwt_required()
+def clear_history():
+    ScanHistory.objects(user=get_jwt_identity()).delete()
+    return jsonify({"deleted": True})
+
+===== FILE: app\routes\products.py =====
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import jwt_required
+from app.models.product import Product
+from app.services.off_client import fetch_product_by_barcode, ProductNotFoundError, search_products
+
+products_bp = Blueprint("products", __name__, url_prefix="/api/products")
+
+
+@products_bp.get("/barcode/<barcode>")
+@jwt_required()
+def get_by_barcode(barcode):
+    barcode = barcode.strip()
+
+    cached = Product.objects(barcode=barcode).first()
+    if cached:
+        return jsonify({"product": cached.to_dict(), "cached": True})
+
+    try:
+        product_data = fetch_product_by_barcode(barcode)
+    except ProductNotFoundError as exc:
+        return jsonify({"error": str(exc), "not_found": True}), 404
+
+    product = Product(**product_data)
+    product.save()
+
+    return jsonify({"product": product.to_dict(), "cached": False})
+
+
+@products_bp.get("/search")
+@jwt_required()
+def search():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"results": []})
+    results = search_products(query)
+    return jsonify({"results": results})
+
+
+===== FILE: app\routes\__init__.py =====
+
+===== FILE: app\services\health_condition_engine.py =====
+"""
+Health-condition rule engine.
+
+Pure product-warning logic - never diagnoses the user. Reads from the
+new reference collections (health_conditions, ingredient_risk_rules,
+nutrition_risk_rules, ingredients, ingredient_aliases). If none of
+these collections have data yet, this returns an empty list and the
+rest of the app keeps working exactly as before.
+"""
+
+import re
+from app.models.health import (
+    HealthCondition, Ingredient, IngredientAlias,
+    IngredientRiskRule, NutritionRiskRule,
+)
+
+SEVERITY_RANK = {"Safe": 0, "Caution": 1, "Limit": 2, "Avoid": 3}
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+
+
+def _find_matching_ingredient_ids(ingredients_text: str):
+    """Best-effort substring match of ingredient/alias normalized names
+    against the raw ingredients text. Safe no-op if no ingredients are
+    configured yet."""
+    if not ingredients_text:
+        return set()
+    haystack = _normalize(ingredients_text)
+    matched = set()
+
+    try:
+        for ing in Ingredient.objects(active=True):
+            needle = _normalize(ing.normalized_name or ing.ingredient_name)
+            if needle and needle in haystack:
+                matched.add(ing.id)
+
+        for alias in IngredientAlias.objects():
+            needle = _normalize(alias.normalized_alias or alias.alias_name)
+            if needle and needle in haystack:
+                matched.add(alias.ingredient.id)
+    except Exception:
+        # Collections not yet seeded / reachable - fail safe, no warnings.
+        return set()
+
+    return matched
+
+
+def _parse_numeric(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.search(r"-?\d+(?:\.\d+)?", str(value))
+    return float(m.group()) if m else None
+
+
+def _worse(a: str, b: str) -> str:
+    return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
+
+
+def evaluate_health_conditions(ingredients_text: str, nutrition: dict, age_group: str | None = None) -> list:
+    """
+    Returns a list of dicts:
+      {"condition_name", "severity", "reason", "recommendation"}
+    One entry per health condition that has at least one matching rule.
+    Returns [] if no rules are configured - never raises to the caller.
+    """
+    nutrition = nutrition or {}
+    warnings_by_condition = {}  # condition_id -> {severity, reasons:set, recommendation}
+
+    try:
+        matched_ingredient_ids = _find_matching_ingredient_ids(ingredients_text)
+
+        # --- Ingredient-based rules ---
+        if matched_ingredient_ids:
+            rules = IngredientRiskRule.objects(
+                ingredient__in=list(matched_ingredient_ids), active=True
+            )
+            for rule in rules:
+                if age_group and rule.age_group_name and rule.age_group_name != age_group:
+                    continue
+                if rule.condition is None:
+                    continue  # broad/non-condition rules aren't shown as health-condition warnings
+                cid = str(rule.condition.id)
+                entry = warnings_by_condition.setdefault(cid, {
+                    "condition": rule.condition,
+                    "severity": "Safe",
+                    "reasons": [],
+                    "recommendation": "",
+                })
+                entry["severity"] = _worse(entry["severity"], rule.severity)
+                if rule.reason:
+                    entry["reasons"].append(rule.reason)
+                if rule.recommendation:
+                    entry["recommendation"] = rule.recommendation
+
+        # --- Nutrition-based rules ---
+        nutrient_rules = NutritionRiskRule.objects(active=True)
+        for rule in nutrient_rules:
+            if rule.applicable_condition is None:
+                continue
+            value = _parse_numeric(nutrition.get(rule.nutrient_name))
+            if value is None:
+                continue
+            triggered = False
+            if rule.minimum_value is not None and value >= rule.minimum_value:
+                triggered = True
+            if rule.maximum_value is not None and value <= rule.maximum_value and rule.minimum_value is None:
+                triggered = True
+            if not triggered:
+                continue
+            cid = str(rule.applicable_condition.id)
+            entry = warnings_by_condition.setdefault(cid, {
+                "condition": rule.applicable_condition,
+                "severity": "Safe",
+                "reasons": [],
+                "recommendation": "",
+            })
+            entry["severity"] = _worse(entry["severity"], rule.severity)
+            if rule.description:
+                entry["reasons"].append(rule.description)
+            if rule.recommendation:
+                entry["recommendation"] = rule.recommendation
+
+    except Exception:
+        # Any unexpected issue (e.g. collections not migrated yet) -
+        # degrade gracefully instead of breaking product analysis.
+        return []
+
+    results = []
+    for entry in warnings_by_condition.values():
+        if entry["severity"] == "Safe":
+            continue
+        results.append({
+            "condition_name": entry["condition"].condition_name,
+            "severity": entry["severity"],
+            "reason": " ".join(entry["reasons"]) or "Based on this product's ingredients or nutrition profile.",
+            "recommendation": entry["recommendation"] or
+                f"People with {entry['condition'].condition_name.lower()} should check this product carefully.",
+        })
+    return results
+
+===== FILE: app\services\nutrition_analyzer.py =====
+"""
+NutriCheck analysis engine.
+
+Produces an AnalysisResult (overall verdict, per-age-group suitability,
+ingredient flags and nutrition concerns) from raw ingredients text and a
+nutrition table (values expected per 100g/100ml, matching Open Food Facts
+conventions). This is a genuine rule engine based on published nutrition
+guidance (WHO sugar guidelines, EFSA caffeine guidance, UK Food Standards
+Agency traffic-light thresholds) - it is NOT hard-coded per product.
+"""
+
+import re
+
+# --- Ingredient watch-lists -------------------------------------------------
+
+CAFFEINE_PATTERNS = [r"\bcaffeine\b", r"\bguarana\b", r"\byerba mate\b"]
+
+ARTIFICIAL_SWEETENERS = [
+    "aspartame", "sucralose", "saccharin", "acesulfame", "acesulfame-k",
+    "acesulfame potassium", "cyclamate", "neotame",
+]
+
+ARTIFICIAL_COLORS = [
+    "tartrazine", "e102", "e110", "sunset yellow", "e122", "carmoisine",
+    "e124", "ponceau", "e129", "allura red", "e133", "brilliant blue",
+    "e127", "erythrosine",
+]
+
+HIGH_RISK_ADDITIVES = {
+    "monosodium glutamate": "MSG - can trigger sensitivity reactions in some people.",
+    "msg": "MSG - can trigger sensitivity reactions in some people.",
+    "high fructose corn syrup": "High fructose corn syrup - linked to excess sugar intake.",
+    "sodium nitrite": "Sodium nitrite - preservative linked to health concerns with regular high intake.",
+    "sodium nitrate": "Sodium nitrate - preservative linked to health concerns with regular high intake.",
+    "partially hydrogenated": "Partially hydrogenated oil - a source of trans fat.",
+    "trans fat": "Trans fat - raises LDL cholesterol, avoid regular consumption.",
+    "bha": "BHA (E320) - synthetic antioxidant preservative, moderate intake advised.",
+    "bht": "BHT (E321) - synthetic antioxidant preservative, moderate intake advised.",
+    "sodium benzoate": "Sodium benzoate - preservative, fine in moderation.",
+    "potassium sorbate": "Potassium sorbate - preservative, generally recognised as safe in normal amounts.",
+}
+
+ALLERGENS = [
+    "milk", "peanut", "peanuts", "tree nut", "almond", "cashew", "walnut",
+    "soy", "soybean", "wheat", "gluten", "egg", "eggs", "fish", "shellfish",
+    "sesame",
+]
+
+STIMULANT_LIMIT_MG_PER_100ML = 15  # above this we flag caffeine content explicitly
+
+
+def _find_matches(patterns, text_lower):
+    found = []
+    for p in patterns:
+        if re.search(p, text_lower):
+            found.append(p.strip(r"\b"))
+    return found
+
+
+def _extract_caffeine_mg_per_100ml(ingredients_text: str):
+    match = re.search(r"caffeine[^0-9]{0,10}(\d+(?:\.\d+)?)\s*mg", ingredients_text, re.I)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _parse_numeric(value):
+    """Extract a float from strings like '10.8g', '47 kcal', '0.05g'."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+    return float(match.group()) if match else None
+
+
+def analyze(ingredients_text: str, nutrition: dict, category: str = "food") -> dict:
+    ingredients_text = ingredients_text or ""
+    text_lower = ingredients_text.lower()
+    nutrition = nutrition or {}
+
+    sugars = _parse_numeric(nutrition.get("sugars"))
+    salt = _parse_numeric(nutrition.get("salt"))
+    sat_fat = _parse_numeric(nutrition.get("saturatedFat"))
+    energy_kcal = _parse_numeric(nutrition.get("energy"))
+    fiber = _parse_numeric(nutrition.get("fiber"))
+    protein = _parse_numeric(nutrition.get("protein"))
+
+    flags = []
+    nutrition_concerns = []
+
+    # --- Ingredient-based flags ---
+    caffeine_hits = _find_matches(CAFFEINE_PATTERNS, text_lower)
+    caffeine_mg = _extract_caffeine_mg_per_100ml(ingredients_text)
+    has_caffeine = bool(caffeine_hits) or caffeine_mg is not None
+    if has_caffeine:
+        detail = f"Contains caffeine ({caffeine_mg:.0f}mg/100ml)." if caffeine_mg else "Contains caffeine or caffeine-related stimulants."
+        flags.append({"ingredient": "Caffeine", "concern": detail})
+
+    for sweetener in ARTIFICIAL_SWEETENERS:
+        if sweetener in text_lower:
+            flags.append({
+                "ingredient": sweetener.title(),
+                "concern": "Artificial sweetener - not recommended for young children.",
+            })
+            break
+
+    for color in ARTIFICIAL_COLORS:
+        if color in text_lower:
+            flags.append({
+                "ingredient": color.title(),
+                "concern": "Artificial colour - some colours are linked to hyperactivity in children (EU warning label required).",
+            })
+            break
+
+    for key, concern in HIGH_RISK_ADDITIVES.items():
+        if key in text_lower:
+            flags.append({"ingredient": key.title(), "concern": concern})
+
+    allergen_hits = sorted({a for a in ALLERGENS if re.search(rf"\b{re.escape(a)}\b", text_lower)})
+    for allergen in allergen_hits[:4]:
+        flags.append({"ingredient": allergen.title(), "concern": "Common allergen present."})
+
+    # --- Nutrition-based concerns (per 100g/100ml, UK FSA style thresholds) ---
+    if sugars is not None:
+        if sugars > 22.5:
+            nutrition_concerns.append({"label": "Sugars", "value": f"{sugars:g}g", "concern": "High sugar content (>22.5g/100g)."})
+        elif sugars > 5:
+            nutrition_concerns.append({"label": "Sugars", "value": f"{sugars:g}g", "concern": "Moderate sugar content."})
+
+    if salt is not None:
+        if salt > 1.5:
+            nutrition_concerns.append({"label": "Salt", "value": f"{salt:g}g", "concern": "High salt content (>1.5g/100g)."})
+        elif salt > 0.3:
+            nutrition_concerns.append({"label": "Salt", "value": f"{salt:g}g", "concern": "Moderate salt content."})
+
+    if sat_fat is not None:
+        if sat_fat > 5:
+            nutrition_concerns.append({"label": "Saturated Fat", "value": f"{sat_fat:g}g", "concern": "High saturated fat content (>5g/100g)."})
+        elif sat_fat > 1.5:
+            nutrition_concerns.append({"label": "Saturated Fat", "value": f"{sat_fat:g}g", "concern": "Moderate saturated fat content."})
+
+    if energy_kcal is not None and energy_kcal > 400 and category == "drinks":
+        nutrition_concerns.append({"label": "Energy", "value": f"{energy_kcal:g} kcal", "concern": "High energy density for a beverage."})
+
+    # --- Per-age-group verdicts ---
+    age_groups = []
+
+    # Child (<13)
+    child_status, child_reasons = "suitable", []
+    if has_caffeine:
+        child_status = "avoid"
+        child_reasons.append("Contains caffeine - not recommended under 12 years.")
+    if sugars is not None and sugars > 22.5:
+        child_status = "avoid" if child_status != "avoid" else child_status
+        child_reasons.append("Very high sugar content.")
+    elif sugars is not None and sugars > 5 and child_status != "avoid":
+        child_status = "caution"
+        child_reasons.append("Moderate-to-high sugar content; limit portion size.")
+    if any(f["ingredient"] in ("Tartrazine", "E110", "Sunset Yellow") or "colour" in f["concern"].lower() for f in flags):
+        child_status = "avoid" if child_status == "avoid" else "caution"
+        child_reasons.append("Artificial colours linked to hyperactivity in children.")
+    if allergen_hits:
+        child_reasons.append(f"Contains allergen(s): {', '.join(a.title() for a in allergen_hits)}.")
+    if not child_reasons:
+        child_reasons.append("No major concerns identified for this age group.")
+    age_groups.append({"group": "Child", "status": child_status, "reason": " ".join(child_reasons)})
+
+    # Teenager (13-17)
+    teen_status, teen_reasons = "suitable", []
+    if has_caffeine:
+        if caffeine_mg and caffeine_mg > STIMULANT_LIMIT_MG_PER_100ML:
+            teen_status = "caution"
+            teen_reasons.append("High caffeine level - may affect sleep and concentration. Limit intake.")
+        else:
+            teen_status = "caution"
+            teen_reasons.append("Contains caffeine - consume in moderation.")
+    if sugars is not None and sugars > 22.5:
+        teen_status = "caution" if teen_status == "suitable" else teen_status
+        teen_reasons.append("High sugar content.")
+    if any(k in text_lower for k in HIGH_RISK_ADDITIVES):
+        teen_status = "caution" if teen_status == "suitable" else teen_status
+        teen_reasons.append("Contains additives best consumed occasionally, not daily.")
+    if not teen_reasons:
+        teen_reasons.append("No major concerns identified for this age group.")
+    age_groups.append({"group": "Teenager", "status": teen_status, "reason": " ".join(teen_reasons)})
+
+    # Adult (18+)
+    adult_status, adult_reasons = "suitable", []
+    if sugars is not None and sugars > 22.5 and salt is not None and salt > 1.5:
+        adult_status = "caution"
+        adult_reasons.append("High in both sugar and salt - fine occasionally, not as a daily staple.")
+    elif sugars is not None and sugars > 22.5:
+        adult_status = "caution"
+        adult_reasons.append("High sugar content - consume in moderation.")
+    elif salt is not None and salt > 1.5:
+        adult_status = "caution"
+        adult_reasons.append("High salt content - consume in moderation.")
+    if has_caffeine and caffeine_mg and caffeine_mg > 30:
+        adult_status = "caution" if adult_status == "suitable" else adult_status
+        adult_reasons.append("Significant caffeine content - be mindful of total daily intake.")
+    if not adult_reasons:
+        adult_reasons.append("Suitable for typical adult consumption in normal portions.")
+    age_groups.append({"group": "Adult", "status": adult_status, "reason": " ".join(adult_reasons)})
+
+    # --- Overall verdict ---
+    statuses = [g["status"] for g in age_groups]
+    if "avoid" in statuses:
+        overall = "Avoid"
+    elif "caution" in statuses:
+        overall = "Use Caution"
+    else:
+        overall = "Generally Suitable"
+
+    return {
+        "overall": overall,
+        "age_groups": age_groups,
+        "flags": flags,
+        "nutrition_concerns": nutrition_concerns,
+    }
+
+
+===== FILE: app\services\ocr_service.py =====
+"""
+OCR service - extracts ingredients text and nutrition values from a
+photographed label using Tesseract OCR. Used by the OCR-camera flow when a
+product has no barcode or the barcode isn't in the product database.
+
+Public API (unchanged):
+    extract_ingredients_from_image(image_bytes) -> str
+    extract_nutrition_from_image(image_bytes)   -> dict
+    parse_nutrition_text(raw_text)              -> dict
+
+New helpers (optional to use from routes):
+    looks_like_ingredients(text)  -> bool
+    nutrition_is_usable(nutrition) -> bool
+"""
+
+import io
+import re
+import pytesseract
+from PIL import Image, ImageOps, ImageFilter
+from flask import current_app
+
+_TARGET_WIDTH = 2000   # upscale small photos to roughly this width
+_MAX_WIDTH = 3200      # downscale huge phone photos (faster, no accuracy loss)
+
+
+# --- Image preprocessing ------------------------------------------------
+
+def _otsu_threshold(gray: Image.Image) -> int:
+    """Pick a black/white threshold automatically (Otsu's method)."""
+    hist = gray.histogram()[:256]
+    total = sum(hist)
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    sum_b = 0
+    w_b = 0
+    best = 0.0
+    threshold = 128
+    for i in range(256):
+        w_b += hist[i]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * hist[i]
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        between = w_b * w_f * (m_b - m_f) ** 2
+        if between > best:
+            best = between
+            threshold = i
+    return threshold
+
+
+def _preprocess(image: Image.Image) -> Image.Image:
+    image = ImageOps.exif_transpose(image)
+    image = image.convert("L")  # grayscale
+
+    # Normalise size: Tesseract works best when text is ~25-35px tall.
+    if image.width < _TARGET_WIDTH:
+        scale = _TARGET_WIDTH / image.width
+        image = image.resize(
+            (int(image.width * scale), int(image.height * scale)),
+            Image.LANCZOS,
+        )
+    elif image.width > _MAX_WIDTH:
+        scale = _MAX_WIDTH / image.width
+        image = image.resize(
+            (int(image.width * scale), int(image.height * scale)),
+            Image.LANCZOS,
+        )
+
+    image = ImageOps.autocontrast(image, cutoff=2)
+    image = image.filter(ImageFilter.MedianFilter(3))  # remove speckle noise
+    image = image.filter(ImageFilter.SHARPEN)
+    return image
+
+
+def _binarize(gray: Image.Image) -> Image.Image:
+    threshold = _otsu_threshold(gray)
+    return gray.point(lambda p: 255 if p > threshold else 0)
+
+
+def _score(text: str) -> float:
+    """Rough 'how readable is this' score: real words + numbers."""
+    words = len(re.findall(r"[A-Za-z]{3,}", text))
+    numbers = len(re.findall(r"\d+(?:[.,]\d+)?", text))
+    return words + 0.5 * numbers
+
+
+def _run_ocr(image_bytes: bytes) -> str:
+    """Run Tesseract a few different ways and keep the most readable result."""
+    tesseract_cmd = current_app.config.get("TESSERACT_CMD")
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    image = Image.open(io.BytesIO(image_bytes))
+    gray = _preprocess(image)
+    binary = _binarize(gray)
+
+    attempts = [
+        (gray, 6),
+        (binary, 6),
+        (gray, 4),
+    ]
+
+    best_text = ""
+    best_score = -1.0
+    for img, psm in attempts:
+        config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=1"
+        try:
+            text = pytesseract.image_to_string(img, config=config)
+        except pytesseract.TesseractError:
+            continue
+        score = _score(text)
+        if score > best_score:
+            best_score = score
+            best_text = text
+    return best_text
+
+
+# --- Ingredients --------------------------------------------------------
+
+# Tolerant of OCR slips such as "Ingredlents" / "Ingredients."
+_INGREDIENTS_HEADER = re.compile(r"ingr[a-z0-9]{2,6}ts?\s*[:\-.]?", re.I)
+
+# Things that usually come right AFTER the ingredients list on a label.
+_INGREDIENTS_STOP = re.compile(
+    r"(nutrition(al)?\s*(information|facts|value)|allergen|manufactured|"
+    r"marketed|mfd|mfg|best\s*before|fssai|net\s*(wt|weight|qty|quantity)|"
+    r"store\s+in|customer\s*care|use\s+by)",
+    re.I,
+)
+
+
+def _clean_text(raw: str) -> str:
+    text = re.sub(r"[ \t]+", " ", raw or "")
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = text.strip()
+
+    # Isolate the ingredients section if the label has an "Ingredients" header.
+    match = _INGREDIENTS_HEADER.search(text)
+    if match:
+        text = text[match.end():].strip()
+        stop = _INGREDIENTS_STOP.search(text)
+        if stop and stop.start() > 20:
+            text = text[:stop.start()].strip()
+
+    # Re-join words broken across lines ("emul-\nsifier").
+    text = re.sub(r"-\n(?=[a-z])", "", text)
+    # Ingredients are comma separated, so line wraps are just spaces.
+    if text.count(",") >= 2:
+        text = re.sub(r"\s*\n\s*", " ", text)
+
+    return text.strip()
+
+
+def extract_ingredients_from_image(image_bytes: bytes) -> str:
+    raw_text = _run_ocr(image_bytes)
+    return _clean_text(raw_text)
+
+
+def looks_like_ingredients(text: str) -> bool:
+    """True if the text plausibly is an ingredients list (not just a brand
+    name or random noise). Use this in the route to avoid showing a
+    'Suitable' verdict when nothing useful was read."""
+    if not text:
+        return False
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    separators = text.count(",") + text.count(";")
+    return len(words) >= 6 and separators >= 2
+
+
+# --- Nutrition table OCR -----------------------------------------------
+
+_NUM = r"(\d+(?:[.,]\d+)?)"
+# Gap between a label and its number. Allows units like "(g)", ":", "|", "kcal"
+# but NOT digits or line breaks, so we never grab the next row's number.
+_GAP = r"[^0-9\n]{0,25}"
+
+# Each nutrient maps to label variants that might appear on a real
+# packaging nutrition table, tolerant of common OCR misreads and of both
+# "Fat 5 g" and "Fat (g) 5" layouts.
+_NUTRITION_LABEL_PATTERNS = {
+    "energy": [
+        r"energy[^\n]{0,30}?" + _NUM + r"\s*k?cal",
+        r"calories" + _GAP + _NUM,
+        r"energy" + _GAP + _NUM,
+    ],
+    "fat": [
+        r"total\s+fat" + _GAP + _NUM,
+        r"(?<!saturated\s)(?<!sat\.\s)(?<!trans\s)\bfat\b" + _GAP + _NUM,
+    ],
+    "saturatedFat": [
+        r"saturated" + _GAP + _NUM,
+        r"sat\.?\s*fat" + _GAP + _NUM,
+    ],
+    "carbs": [
+        r"(?:total\s+)?carbohydrates?" + _GAP + _NUM,
+        r"carbs" + _GAP + _NUM,
+    ],
+    "sugars": [
+        r"total\s+sugars?" + _GAP + _NUM,
+        r"(?<!added\s)sugars?" + _GAP + _NUM,
+    ],
+    "fiber": [
+        r"(?:dietary\s+)?fib(?:er|re)" + _GAP + _NUM,
+    ],
+    "protein": [
+        r"proteins?" + _GAP + _NUM,
+    ],
+    "salt": [
+        r"\bsalt\b" + _GAP + _NUM,
+    ],
+    "sodium": [
+        r"sodium" + _GAP + _NUM,
+    ],
+}
+
+# Values per 100 g / 100 ml can't exceed these. Anything bigger is an OCR
+# misread, so it's dropped instead of being trusted.
+_MAX_VALUES = {
+    "energy": 900,
+    "fat": 100,
+    "saturatedFat": 100,
+    "carbs": 100,
+    "sugars": 100,
+    "fiber": 100,
+    "protein": 100,
+    "salt": 100,
+}
+
+
+def _find_first(patterns, text_lower):
+    for pattern in patterns:
+        match = re.search(pattern, text_lower, re.I)
+        if match:
+            value = match.group(1).replace(",", ".")
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _normalize_numbers(text: str) -> str:
+    """Fix the most common digit misreads, only when next to other digits."""
+    text = re.sub(r"(?<=\d)[oO](?=\d)", "0", text)      # 1O5 -> 105
+    text = re.sub(r"(?<=\d)[oO](?=\s*(?:g|mg|%))", "0", text)  # 5O g -> 50 g
+    text = re.sub(r"(?<=\d)[lI|](?=\d)", "1", text)     # 1l5 -> 115
+    return text
+
+
+def parse_nutrition_text(raw_text: str) -> dict:
+    """Best-effort extraction of per-100g/100ml nutrition values from raw
+    OCR text of a nutrition table. Tolerant of label wording variants and
+    OCR noise. Any nutrient not confidently found is simply omitted (None)
+    rather than guessed - callers (analyze()) already treat missing
+    nutrients as 'no concern flagged for this value', never as zero.
+
+    Known limitation: does not reliably distinguish 'per serving' vs
+    'per 100g' columns when both are present on the label - it takes the
+    first plausible match for each nutrient.
+    """
+    text_lower = (raw_text or "").lower()
+    text_lower = re.sub(r"[ \t]+", " ", text_lower)
+    text_lower = _normalize_numbers(text_lower)
+
+    nutrition = {}
+    for key in ("energy", "fat", "saturatedFat", "carbs", "sugars", "fiber", "protein", "salt"):
+        value = _find_first(_NUTRITION_LABEL_PATTERNS[key], text_lower)
+        if value is not None and value <= _MAX_VALUES[key]:
+            nutrition[key] = value
+
+    # If salt wasn't found but sodium was, derive salt from sodium
+    # (standard conversion: salt (g) = sodium (mg) x 2.5 / 1000).
+    if "salt" not in nutrition:
+        sodium_mg = _find_first(_NUTRITION_LABEL_PATTERNS["sodium"], text_lower)
+        if sodium_mg is not None and sodium_mg <= 40000:
+            nutrition["salt"] = round(sodium_mg * 2.5 / 1000, 2)
+
+    return nutrition
+
+
+def extract_nutrition_from_image(image_bytes: bytes) -> dict:
+    raw_text = _run_ocr(image_bytes)
+    return parse_nutrition_text(raw_text)
+
+
+def nutrition_is_usable(nutrition: dict) -> bool:
+    """True if at least 2 nutrient values were read. Use this in the route
+    to avoid showing a 'Suitable' verdict based on an empty table."""
+    return bool(nutrition) and len(nutrition) >= 2
+
+===== FILE: app\services\off_client.py =====
+"""
+Client for the Open Food Facts public API (https://openfoodfacts.org).
+This is the real data source for barcode lookups - replaces the frontend's
+MOCK_PRODUCT entirely. No API key required.
+"""
+
+import requests
+from flask import current_app
+
+
+class ProductNotFoundError(Exception):
+    pass
+
+
+def _nutriment(n: dict, key: str, unit: str = "g") -> str:
+    val = n.get(f"{key}_100g")
+    if val is None:
+        return f"0{unit}"
+    if key == "energy-kcal":
+        return f"{val:g} kcal"
+    return f"{val:g}{unit}"
+
+
+def fetch_product_by_barcode(barcode: str) -> dict:
+    """
+    Look up a product by barcode via Open Food Facts.
+    Raises ProductNotFoundError if the barcode is not in the database.
+    Returns a normalized dict matching our Product schema.
+    """
+    base = current_app.config["OFF_API_BASE"]
+    url = f"{base}/product/{barcode}.json"
+
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "fields": "code,product_name,brands,categories,image_front_url,"
+                          "ingredients_text,nutriments"
+            },
+            timeout=10,
+            headers={"User-Agent": "NutriCheck-App/1.0 (contact@nutricheck.app)"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise ProductNotFoundError(f"Could not reach product database: {exc}")
+
+    data = resp.json()
+    if data.get("status") != 1 or "product" not in data:
+        raise ProductNotFoundError(f"No product found for barcode {barcode}")
+
+    p = data["product"]
+    n = p.get("nutriments", {})
+
+    name = p.get("product_name") or "Unknown Product"
+    if not p.get("product_name"):
+        raise ProductNotFoundError(f"Product {barcode} has no usable name in database")
+
+    return {
+        "barcode": barcode,
+        "name": name,
+        "brand": p.get("brands", "") or "",
+        "category": (p.get("categories", "") or "").split(",")[0].strip(),
+        "image": p.get("image_front_url", "") or "",
+        "ingredients_text": p.get("ingredients_text", "") or "",
+        "nutrition": {
+            "energy": _nutriment(n, "energy-kcal", ""),
+            "fat": _nutriment(n, "fat"),
+            "saturatedFat": _nutriment(n, "saturated-fat"),
+            "carbs": _nutriment(n, "carbohydrates"),
+            "sugars": _nutriment(n, "sugars"),
+            "fiber": _nutriment(n, "fiber"),
+            "protein": _nutriment(n, "proteins"),
+            "salt": _nutriment(n, "salt"),
+        },
+    }
+
+
+def search_products(query: str, page_size: int = 15) -> list:
+    base = current_app.config["OFF_API_BASE"].replace("/api/v2", "")
+    url = f"{base}/cgi/search.pl"
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "search_terms": query,
+                "search_simple": 1,
+                "action": "process",
+                "json": 1,
+                "page_size": page_size,
+            },
+            timeout=10,
+            headers={"User-Agent": "NutriCheck-App/1.0 (contact@nutricheck.app)"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return []
+
+    results = []
+    for p in data.get("products", []):
+        if not p.get("product_name") or not p.get("code"):
+            continue
+        results.append({
+            "barcode": p["code"],
+            "name": p["product_name"],
+            "brand": p.get("brands", "") or "",
+            "image": p.get("image_front_url", "") or "",
+        })
+    return results
+
+
+===== FILE: app\services\seed_health_data.py =====
+"""
+Seed script for the health-condition feature.
+
+Safe to run multiple times - uses get-or-create everywhere, never
+duplicates. Does NOT touch users, products, or scan_history.
+
+Run from the backend folder with the venv active:
+    python -m app.services.seed_health_data
+"""
+
+from app import create_app
+from app.models.health import (
+    HealthCondition, IngredientCategory, Ingredient, IngredientAlias,
+    IngredientRiskRule, NutritionRiskRule,
+)
+
+
+def get_or_create_condition(name, description):
+    obj = HealthCondition.objects(condition_name=name).first()
+    if obj:
+        return obj
+    return HealthCondition(condition_name=name, description=description).save()
+
+
+def get_or_create_category(name):
+    obj = IngredientCategory.objects(category_name=name).first()
+    if obj:
+        return obj
+    return IngredientCategory(category_name=name).save()
+
+
+def get_or_create_ingredient(name, normalized, category):
+    obj = Ingredient.objects(normalized_name=normalized).first()
+    if obj:
+        return obj
+    return Ingredient(ingredient_name=name, normalized_name=normalized, category=category).save()
+
+
+def get_or_create_alias(ingredient, alias, normalized_alias):
+    obj = IngredientAlias.objects(normalized_alias=normalized_alias).first()
+    if obj:
+        return obj
+    return IngredientAlias(ingredient=ingredient, alias_name=alias, normalized_alias=normalized_alias).save()
+
+
+def run():
+    app = create_app()
+    with app.app_context():
+        # --- Health conditions ---
+        diabetes = get_or_create_condition("Diabetes", "Blood sugar management condition.")
+        hbp = get_or_create_condition("High Blood Pressure", "Hypertension.")
+        heart = get_or_create_condition("Heart-related conditions", "Cardiovascular conditions.")
+
+        # --- Categories ---
+        cat_sugar = get_or_create_category("Sugar")
+        cat_sweet = get_or_create_category("Sweet Ingredient")
+        cat_salt = get_or_create_category("Salt/Sodium")
+        cat_fat = get_or_create_category("Fat/Oil")
+
+        # --- Ingredients + aliases ---
+        sugar = get_or_create_ingredient("Sugar", "sugar", cat_sugar)
+        for alias in ["sucrose", "white sugar", "table sugar", "cane sugar", "invert sugar"]:
+            get_or_create_alias(sugar, alias, alias)
+
+        glucose_syrup = get_or_create_ingredient("Glucose Syrup", "glucose syrup", cat_sweet)
+        for alias in ["corn syrup", "high fructose corn syrup", "honey", "molasses", "rice syrup"]:
+            get_or_create_alias(glucose_syrup, alias, alias)
+
+        salt = get_or_create_ingredient("Salt", "salt", cat_salt)
+        for alias in ["sodium chloride", "sea salt", "rock salt", "table salt"]:
+            get_or_create_alias(salt, alias, alias)
+
+        saturated_fat_ingredient = get_or_create_ingredient(
+            "Palm Oil", "palm oil", cat_fat
+        )
+
+        # --- Ingredient risk rules ---
+        if not IngredientRiskRule.objects(ingredient=sugar, condition=diabetes).first():
+            IngredientRiskRule(
+                ingredient=sugar, condition=diabetes, severity="Limit",
+                reason="High-sugar ingredients may be unsuitable for people managing diabetes.",
+                recommendation="People with diabetes should limit or avoid this product.",
+            ).save()
+
+        if not IngredientRiskRule.objects(ingredient=glucose_syrup, condition=diabetes).first():
+            IngredientRiskRule(
+                ingredient=glucose_syrup, condition=diabetes, severity="Limit",
+                reason="Glucose/corn syrups raise blood sugar quickly.",
+                recommendation="People with diabetes should limit or avoid this product.",
+            ).save()
+
+        if not IngredientRiskRule.objects(ingredient=salt, condition=hbp).first():
+            IngredientRiskRule(
+                ingredient=salt, condition=hbp, severity="Caution",
+                reason="Added salt contributes to sodium intake.",
+                recommendation="People with high blood pressure may need to limit high-sodium products.",
+            ).save()
+
+        # --- Nutrition risk rules ---
+        if not NutritionRiskRule.objects(nutrient_name="sugars", applicable_condition=diabetes).first():
+            NutritionRiskRule(
+                nutrient_name="sugars", minimum_value=22.5, severity="Limit",
+                applicable_condition=diabetes,
+                description="High-sugar ingredients may make blood-glucose management more difficult.",
+                recommendation="People with diabetes should limit or avoid this product.",
+            ).save()
+
+        if not NutritionRiskRule.objects(nutrient_name="salt", applicable_condition=hbp).first():
+            NutritionRiskRule(
+                nutrient_name="salt", minimum_value=1.5, severity="Caution",
+                applicable_condition=hbp,
+                description="High salt content (>1.5g/100g).",
+                recommendation="People with high blood pressure may need to limit high-sodium products.",
+            ).save()
+
+        if not NutritionRiskRule.objects(nutrient_name="saturatedFat", applicable_condition=heart).first():
+            NutritionRiskRule(
+                nutrient_name="saturatedFat", minimum_value=5, severity="Caution",
+                applicable_condition=heart,
+                description="High saturated fat content (>5g/100g).",
+                recommendation="People with heart-related conditions may need to limit saturated fat intake.",
+            ).save()
+
+        print("Health-condition seed data ready (idempotent - safe to rerun).")
+
+
+if __name__ == "__main__":
+    run()
+
+===== FILE: app\services\__init__.py =====
+
+===== FILE: app\config.py =====
+import os
+from datetime import timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key")
+    JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-jwt-secret-key")
+
+    MONGODB_SETTINGS = {
+        "host": os.environ.get("MONGODB_URI", "mongodb://localhost:27017/nutricheck")
+    }
+
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(
+        minutes=int(os.environ.get("JWT_ACCESS_MINUTES", 60))
+    )
+    JWT_REFRESH_TOKEN_EXPIRES = timedelta(
+        days=int(os.environ.get("JWT_REFRESH_DAYS", 30))
+    )
+    JWT_TOKEN_LOCATION = ["headers"]
+
+    OFF_API_BASE = os.environ.get(
+        "OFF_API_BASE", "https://world.openfoodfacts.org/api/v2"
+    )
+
+    CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+
+    TESSERACT_CMD = os.environ.get("TESSERACT_CMD", "")
+
+    MAX_CONTENT_LENGTH = 8 * 1024 * 1024  # 8 MB upload limit for OCR images
+
+
+class DevelopmentConfig(Config):
+    DEBUG = True
+
+
+class ProductionConfig(Config):
+    DEBUG = False
+
+
+class TestingConfig(Config):
+    TESTING = True
+    MONGODB_SETTINGS = {"host": "mongomock://localhost/nutricheck_test"}
+
+
+config_by_name = {
+    "development": DevelopmentConfig,
+    "production": ProductionConfig,
+    "testing": TestingConfig,
+}
+
+
+===== FILE: app\extensions.py =====
+from flask_mongoengine import MongoEngine
+from flask_jwt_extended import JWTManager
+from flask_cors import CORS
+
+db = MongoEngine()
+jwt = JWTManager()
+cors = CORS()
+
+
+===== FILE: app\__init__.py =====
+import os
+from flask import Flask, jsonify
+from app.config import config_by_name
+from app.extensions import db, jwt, cors
+
+
+def create_app(config_name=None):
+    config_name = config_name or os.environ.get("FLASK_ENV", "development")
+    app = Flask(__name__)
+    app.config.from_object(config_by_name[config_name])
+
+    db.init_app(app)
+    jwt.init_app(app)
+    cors.init_app(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
+
+    register_blueprints(app)
+    register_error_handlers(app)
+    register_health_check(app)
+
+    return app
+
+
+def register_blueprints(app):
+    from app.routes.auth import auth_bp
+    from app.routes.products import products_bp
+    from app.routes.analysis import analysis_bp
+    from app.routes.history import history_bp
+
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(products_bp)
+    app.register_blueprint(analysis_bp)
+    app.register_blueprint(history_bp)
+
+
+def register_health_check(app):
+    @app.get("/api/health")
+    def health():
+        return jsonify({"status": "ok", "service": "nutricheck-backend"})
+
+
+def register_error_handlers(app):
+    @app.errorhandler(404)
+    def not_found(_e):
+        return jsonify({"error": "Resource not found."}), 404
+
+    @app.errorhandler(413)
+    def too_large(_e):
+        return jsonify({"error": "Uploaded file is too large."}), 413
+
+    @app.errorhandler(500)
+    def server_error(_e):
+        return jsonify({"error": "Internal server error."}), 500
+
+    @app.errorhandler(Exception)
+    def handle_unexpected(e):
+        app.logger.exception("Unhandled exception")
+        return jsonify({"error": "Unexpected server error."}), 500
+
+
+===== FILE: .env.example =====
+# Flask
+FLASK_APP=run.py
+FLASK_ENV=production
+SECRET_KEY=change-this-to-a-long-random-secret-string
+JWT_SECRET_KEY=change-this-to-a-different-long-random-secret
+
+# MongoDB
+# Local: mongodb://localhost:27017/nutricheck
+# Atlas:  mongodb+srv://<user>:<password>@<cluster>.mongodb.net/nutricheck
+MONGODB_URI=mongodb://localhost:27017/nutricheck
+
+# Open Food Facts (public, no key required) - base URL only, override if self-hosting
+OFF_API_BASE=https://world.openfoodfacts.org/api/v2
+
+# CORS - comma separated list of allowed origins for the Flutter web build / admin tools
+CORS_ORIGINS=*
+
+# Tesseract binary path (only needed on Windows, e.g. C:\Program Files\Tesseract-OCR\tesseract.exe)
+TESSERACT_CMD=
+
+# Access token lifetime (minutes) / refresh token lifetime (days)
+JWT_ACCESS_MINUTES=60
+JWT_REFRESH_DAYS=30
+
+
+===== FILE: docker-compose.yml =====
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "5000:5000"
+    environment:
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-jwt-secret}
+      MONGODB_URI: mongodb://mongo:27017/nutricheck
+      OFF_API_BASE: https://world.openfoodfacts.org/api/v2
+      CORS_ORIGINS: "*"
+
+volumes:
+  mongo_data:
+
+
+===== FILE: README.md =====
+# NutriCheck Backend (Flask + MongoDB)
+
+Production-ready REST API for the NutriCheck app. Real data only â€” no mocks:
+
+- **Products**: resolved live from [Open Food Facts](https://world.openfoodfacts.org) on first scan, then cached in MongoDB.
+- **Analysis**: a genuine rule-based engine (`app/services/nutrition_analyzer.py`) using WHO/UK-FSA-style sugar, salt, saturated-fat thresholds plus ingredient watch-lists (caffeine, artificial sweeteners/colors, allergens, additives) to produce Child / Teenager / Adult verdicts.
+- **OCR**: Tesseract-based ingredient-label text extraction for products without a resolvable barcode.
+- **Auth**: JWT (access + refresh tokens), bcrypt password hashing.
+- **History**: per-user scan history stored in MongoDB.
+
+## 1. Prerequisites
+
+- Python 3.11+
+- MongoDB running locally or an Atlas connection string
+- Tesseract OCR engine installed on the host (needed for the `/api/analyze/ocr` endpoint)
+  - macOS: `brew install tesseract`
+  - Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
+  - Windows: install from https://github.com/UB-Mannheim/tesseract/wiki and set `TESSERACT_CMD` in `.env`
+
+## 2. Setup
+
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env: set SECRET_KEY, JWT_SECRET_KEY, MONGODB_URI
+```
+
+## 3. Run MongoDB
+
+Local (Docker):
+```bash
+docker run -d -p 27017:27017 --name nutricheck-mongo mongo:7
+```
+Or point `MONGODB_URI` in `.env` at a MongoDB Atlas cluster.
+
+## 4. Run the API
+
+```bash
+python run.py
+# API now listening on http://0.0.0.0:5000
+```
+
+Production (Gunicorn):
+```bash
+gunicorn -w 4 -b 0.0.0.0:5000 run:app
+```
+
+Or with Docker Compose (spins up Mongo + backend together):
+```bash
+docker compose up --build
+```
+
+## 5. Verify
+
+```bash
+curl http://localhost:5000/api/health
+# {"status":"ok","service":"nutricheck-backend"}
+```
+
+## API Reference
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/auth/register` | â€“ | Create account (name, email, password, age) |
+| POST | `/api/auth/login` | â€“ | Login, returns access + refresh JWT |
+| POST | `/api/auth/refresh` | refresh token | Get a new access token |
+| GET | `/api/auth/me` | access token | Current user profile |
+| PUT | `/api/auth/me` | access token | Update name / age |
+| GET | `/api/products/barcode/<barcode>` | access token | Real product lookup (Open Food Facts, cached) |
+| GET | `/api/products/search?q=` | access token | Product text search |
+| POST | `/api/analyze/product` | access token | Run suitability analysis on a resolved product, saves to history |
+| POST | `/api/analyze/ocr` | access token | Multipart image upload â†’ OCR â†’ analysis, saves to history |
+| GET | `/api/history` | access token | Paginated scan history |
+| GET | `/api/history/<id>` | access token | Single history item |
+| DELETE | `/api/history/<id>` | access token | Delete one history item |
+| DELETE | `/api/history` | access token | Clear all history |
+
+All authenticated endpoints expect `Authorization: Bearer <access_token>`.
+
+## Notes on removing dummy data
+
+The original Figma prototype always returned a single hard-coded `MOCK_PRODUCT` / `MOCK_RESULT`. This backend has **no such fallback** â€” every barcode is a real lookup against Open Food Facts, and every verdict is computed by `nutrition_analyzer.py` from the real ingredients/nutrition returned. If a barcode genuinely isn't in the Open Food Facts database, the API returns a real `404`, which the Flutter app surfaces as the "Product Not Found" screen with an OCR fallback.
+
+
+===== FILE: requirements.txt =====
+Flask==2.2.5
+Werkzeug==2.2.3
+Flask-Cors==4.0.1
+Flask-JWT-Extended==4.6.0
+pymongo==4.8.0
+mongoengine==0.29.1
+Flask-MongoEngine==1.0.0
+python-dotenv==1.0.1
+bcrypt==4.2.0
+requests==2.32.3
+pytesseract==0.3.13
+Pillow==10.4.0
+gunicorn==23.0.0
+marshmallow==3.22.0
+email-validator==2.2.0
+
+
+===== FILE: run.py =====
+import os
+from app import create_app
+
+app = create_app(os.environ.get("FLASK_ENV", "development"))
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=app.config.get("DEBUG", False))
+
